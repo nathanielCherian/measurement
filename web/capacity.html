@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser CC rate</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafafa; --card:#fff; --line:#e3e3e6; --accent:#2563eb; }
+  body { font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; padding: 16px; }
+  main { max-width: 1000px; margin: 0 auto; display: grid; gap: 16px; }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 4px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+  form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; }
+  label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+  input, select { font: 13px ui-monospace, monospace; padding: 5px 6px; border: 1px solid var(--line); border-radius: 4px; }
+  .wide { grid-column: 1 / -1; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: #fff; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  pre { margin: 0; font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; max-height: 240px; overflow: auto; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  .stat.flag b { color: #b45309; }
+  canvas { width: 100%; height: 240px; display: block; }
+  .legend { font-size: 12px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  .note { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+  .warn { background: #fffbeb; border-color: #fcd34d; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Browser congestion-control rate</h1>
+  <p class="note">Writes datagrams as fast as the browser will accept them and measures what actually arrives at the
+    server. A rate on its own is ambiguous, so the run also records <b>what was offered</b> here and, at the server, the
+    <b>loss split</b>: application packets that never arrived while the QUIC packet numbers around them all did were
+    dropped <em>inside the browser</em> — proof that its congestion control, not the path, was the limit. The verdict
+    below says which of the four possible bottlenecks (browser CC, path, this page, the server) the run measured.
+    Other pages: <a href="index.html">WebTransport probe</a>, <a href="rtc.html">WebRTC probe</a>,
+    <a href="trains.html">packet trains</a>, <a href="rtt.html">RTT monitor</a>.</p>
+
+  <section class="card warn">
+    <p class="note" style="margin:0">This saturates your uplink for the whole run. On a phone it uses real data — a
+      10 s run at 20 Mbps is about 25 MB — and it will slow down anything else on the link. Runs are capped at 120 s.</p>
+  </section>
+
+  <section class="card">
+    <form id="form">
+      <label>Transport
+        <select name="transport">
+          <option value="webtransport">WebTransport datagrams (QUIC CC)</option>
+          <option value="webrtc">WebRTC DataChannel (SCTP CC)</option>
+        </select>
+      </label>
+      <label>Mode
+        <select name="mode">
+          <option value="saturate">saturate — write flat out</option>
+          <option value="ramp">ramp — step the rate up and find the knee</option>
+        </select>
+      </label>
+      <label>Duration (s) <input name="durationS" type="number" value="15" min="3" max="120"></label>
+      <label>Packet size (bytes) <input name="size" type="number" value="1000" min="64" max="1200"></label>
+      <label>Pending-write window <input name="pending" type="number" value="64" min="1" max="1024"></label>
+      <label>Ramp: first step (Mbps) <input name="startMbps" type="number" value="1" min="0.1" step="0.1"></label>
+      <label>Ramp: last step (Mbps) <input name="maxMbps" type="number" value="128" min="1"></label>
+      <label>Ramp: seconds per step <input name="stepS" type="number" value="3" min="1"></label>
+      <label class="wide">WebTransport URL <input name="url" value="https://127.0.0.1:4433/probe"></label>
+      <label class="wide">WebRTC signaling URL <input name="signalUrl" value="http://localhost:8080/offer"></label>
+      <label class="wide">TCP comparison URL base <input name="loadUrl" value="http://localhost:8081/trains/load"></label>
+      <div class="row wide">
+        <button id="run" type="submit">Run</button>
+        <button id="stop" type="button" class="secondary" disabled>Stop</button>
+        <button id="tcp" type="button" class="secondary">Compare with TCP upload</button>
+        <button id="download" type="button" class="secondary" disabled>Download JSON</button>
+        <span id="status" style="color:var(--muted)"></span>
+        <span id="tcpResult" style="color:var(--muted)"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="card"><div class="stats" id="stats"></div></section>
+
+  <section class="card">
+    <h2>Offered vs delivered</h2>
+    <p class="note">The page's offered rate against what the server actually received, second by second. In
+      <b>saturate</b> mode the gap between the two lines is what the browser refused to send. In <b>ramp</b> mode the
+      knee — where delivered stops following offered — is the rate its congestion control settled at.</p>
+    <div class="legend" id="rateLegend"></div>
+    <canvas id="rateChart"></canvas>
+    <h2>RTT while saturating</h2>
+    <p class="note">The server's own QUIC RTT to this browser. If it climbs as the rate rises, the bottleneck queue is
+      filling — the classic bufferbloat signature, and the reason a loss-based controller finds this rate at all.</p>
+    <div class="legend" id="rttLegend"></div>
+    <canvas id="rttChart"></canvas>
+  </section>
+
+  <section class="card" id="verdict"></section>
+
+  <section class="card"><pre id="log"></pre></section>
+</main>
+<script type="module" src="capacity-main.js"></script>
+</body>
+</html>

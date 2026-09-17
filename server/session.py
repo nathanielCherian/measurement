@@ -24,6 +24,7 @@ import protocol as proto
 from appcc import make_cc
 from ack import AckGenerator
 from rtt import RttMonitor, RttStreamReceiver, run_rtt_stream
+from saturation import summarize_saturation, window_report
 from trains import TrainReceiver, send_trains
 from transport_stats import ReceiverStats, SenderCore
 from up_analysis import analyze_up
@@ -37,6 +38,7 @@ SAMPLE_MS = 100
 QUIC_SAMPLE_MS = 20
 MAX_PENDING_DATAGRAMS = 64  # beyond this, aioquic's own cwnd/pacer is the bottleneck
 MAX_SIZE = 1100
+LOG_RECORD_CAP = 50_000  # beyond this, per-packet rows are left out of the saved log
 
 
 def now_ms() -> float:
@@ -88,6 +90,7 @@ class Session:
         self.down_rtt = RttMonitor()
         self._rtt_task: Optional[asyncio.Task] = None
         self.up_quic_samples: list = []
+        self._sat_task: Optional[asyncio.Task] = None
         self._up_task: Optional[asyncio.Task] = None
         self.start_ms: Optional[float] = None
         self._task: Optional[asyncio.Task] = None
@@ -146,11 +149,19 @@ class Session:
             if msg.get("mode") in ("up", "both"):
                 self.quic.rx_packets = []
                 self._up_task = asyncio.ensure_future(self._sample_up_quic())
+            if msg.get("saturate"):
+                self._sat_task = asyncio.ensure_future(self._report_progress(msg["saturate"]))
         elif kind == "finish":
             self.quic.rx_packets_final = self.quic.rx_packets
             self.quic.rx_packets = None
             if self._up_task:
                 self._up_task.cancel()
+            if self._sat_task:
+                self._sat_task.cancel()
+            # The page sends its own offered-rate counters with "finish", so the
+            # report can say whether the sender or the browser was the limit.
+            if msg.get("client_offered") and self.config.get("saturate") is not None:
+                self.config["saturate"]["client_offered"] = msg["client_offered"]
             self.send_control({"type": "server_report", **self.report(brief=True)})
         elif kind == "results":
             path = self._save(msg)
@@ -257,6 +268,30 @@ class Session:
                 )
             await asyncio.sleep(QUIC_SAMPLE_MS / 1000)
 
+    async def _report_progress(self, cfg: Dict[str, Any]) -> None:
+        """Tell the page what is actually arriving, while it is arriving.
+
+        A saturation run is only meaningful live: the page has no idea how much
+        of what it writes survives the browser's own send queue, so the server's
+        view is the measurement and it has to come back during the run.
+        """
+        interval = float(cfg.get("progress_ms", 500)) / 1000
+        last = now_ms()
+        while not self.closed:
+            await asyncio.sleep(interval)
+            t = now_ms()
+            if self.up.records is None:
+                continue
+            win = window_report(self.up.records, last, t)
+            last = t
+            self.send_control({
+                "type": "up_progress",
+                "t_ms": t - (self.start_ms or self.created),
+                **win,
+                "quic": self._quic_state(),
+                "packets_total": self.up.received,
+            })
+
     def _quic_state(self) -> Dict[str, Any]:
         loss = getattr(self.quic, "_loss", None)
         if loss is None:
@@ -318,6 +353,11 @@ class Session:
                 self.up_quic_samples,
                 self.start_ms or self.created,
             )
+        if out.get("up_analysis") and self.config.get("saturate"):
+            out["saturation"] = summarize_saturation(
+                out["up_analysis"],
+                client_offered=self.config.get("saturate", {}).get("client_offered"),
+            )
         if self.shaper_stats:
             out["netem"] = self.shaper_stats()
         if self.down:
@@ -329,7 +369,12 @@ class Session:
         else:
             out["down"] = None
         if not brief:
-            out["up_records"] = self.up.records
+            # A saturation run has too many rows to serialise; the 100 ms bins in
+            # up_analysis carry the same story at a thousandth of the size.
+            records = self.up.records
+            out["up_records"] = records if records is not None and len(records) <= LOG_RECORD_CAP else None
+            out["up_records_omitted"] = records is not None and len(records) > LOG_RECORD_CAP
+            out["up_records_truncated"] = getattr(self.up, "records_truncated", False)
             out["down_records"] = self.down.records if self.down else None
         return out
 
@@ -358,6 +403,8 @@ class Session:
             self._trains_task.cancel()
         if self._rtt_task:
             self._rtt_task.cancel()
+        if self._sat_task:
+            self._sat_task.cancel()
         if not self.saved and not self.config.get("reference") and (self.up.received or self.down or self.up_rtt.received):
             # The peer vanished mid-run (common on mobile): keep what we have.
             try:

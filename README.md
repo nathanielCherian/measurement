@@ -182,6 +182,47 @@ emulator, which only shapes the WebTransport port.
 Deployment adds `browser-cc-http-trains.service` and an nginx `location /trains/` with
 `proxy_request_buffering off`, so bodies stream through instead of being buffered whole.
 
+## Browser congestion-control rate (`web/capacity.html`)
+
+How fast will the browser's own QUIC stack let us send? The page writes datagrams as fast as the
+transport accepts them and the server counts what arrives. A rate alone is ambiguous, so the run
+pairs it with the reason — there are four ways to get a number here, and only one of them is the
+measurement you want:
+
+| Limited by | Evidence | What the rate means |
+|---|---|---|
+| **Browser CC** | app sequence numbers missing while their QUIC packet numbers were all used | the ceiling — what you're after |
+| **Path** | QUIC packet numbers missing too | the link's capacity; the CC just fitted it |
+| **This page** | nothing dropped anywhere, offered ≈ delivered | a floor, not a ceiling — raise packet size or the write window |
+| **The server** | high IAT / `local_queue_ms_lb` at the receiver | not a measurement |
+
+The browser-drop signal is the crux, and it is free: QUIC datagrams are congestion controlled but
+never retransmitted, so once the cwnd is full the browser discards them **in its own queue**.
+`quic_instrument.py` already records a packet number per received datagram, so a missing sequence
+number with no missing packet number around it is proof the browser refused to send it
+(`dropped_before_send_estimate`). `server/saturation.py` turns that into a verdict.
+
+Two modes:
+
+- **saturate** — write flat out for the run. Simplest ceiling measurement.
+- **ramp** — step the offered rate up (doubling, N seconds per step) and watch where delivered stops
+  following offered. That knee is the CC's rate, found without hammering the link the whole time.
+
+Both report steady-state rate (the first 2 s of slow start are excluded), peak bin, ramp time to 90%,
+the server's QUIC RTT during the flood, and implied bytes in flight (rate × RTT). A **Compare with
+TCP upload** button runs a POST upload over the same path: if TCP goes much faster, the datagram
+path is the more conservative one.
+
+Validated against the emulated 10 Mbps uplink (`--emulate-up-mbps 10 --emulate-up-queue-ms 100`),
+Chrome, 15 s saturate: steady state **9.68 Mbps** (p95 9.76), verdict **browser-cc**, with 86% of
+offered packets dropped inside the browser against 0.11% network loss, implied 98 KB in flight at
+82.7 ms RTT. Ramp mode on the same link pinned delivered at 9.71 Mbps while offered climbed to
+32 Mbps, and the RTT chart showed the queue filling at exactly the knee.
+
+Caveats: this saturates the uplink (a phone on 5G burns real data — runs are capped at 120 s and the
+page says so); Chrome's `maxDatagramSize` is ~1024 B, so larger packet sizes are clamped; and per
+-packet records are capped server-side (`MAX_RECORDS`) with the 100 ms bins carrying the analysis.
+
 ## RTT monitor (`web/rtt.html`)
 
 A thin, steady stream instead of a burst: one small packet every `interval_ms` (default 64 B every

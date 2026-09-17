@@ -3,6 +3,9 @@
 mode "packet": one ACK datagram per received DATA packet (echoes send_ts).
 mode "block":  ACK_BLOCK datagrams, sent when `every_n` packets are pending or
                `interval_ms` after the first pending packet, whichever is first.
+mode "none":   no ACKs at all. For saturation tests, where the sender is trying
+               to fill its uplink and ACK traffic would only add work at both
+               ends; the server sees every packet anyway.
 """
 
 import asyncio
@@ -38,6 +41,8 @@ class AckGenerator:
         self._timer: Optional[asyncio.TimerHandle] = None
 
     def on_packet(self, seq: int, send_ts: float, recv_ts: float) -> None:
+        if self.mode == "none":
+            return
         if self.mode == "packet":
             self.send(proto.encode_ack(self.flow, seq, send_ts, recv_ts))
             self.acks_sent += 1

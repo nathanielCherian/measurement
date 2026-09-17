@@ -161,10 +161,17 @@ class SenderCore:
         }
 
 
+# A saturation run delivers packets by the hundred thousand, so per-packet
+# records are capped: past this the counters and bins keep going, but the
+# per-packet list stops growing (and says so), rather than eating the server.
+MAX_RECORDS = 400_000
+
+
 class ReceiverStats:
     """Counts arrivals, loss (by sequence gaps), reordering, jitter and goodput."""
 
     def __init__(self, keep_records: bool = True) -> None:
+        self.records_truncated = False
         self.received = 0
         self.bytes = 0
         self.max_seq = -1
@@ -199,7 +206,10 @@ class ReceiverStats:
         b = int((recv_ts - self.first_recv) // BIN_MS)
         self.bins[b] = self.bins.get(b, 0) + size
         if self.records is not None:
-            self.records.append([seq, send_ts, recv_ts, size, pn])
+            if len(self.records) < MAX_RECORDS:
+                self.records.append([seq, send_ts, recv_ts, size, pn])
+            else:
+                self.records_truncated = True
 
     def summary(self) -> Dict[str, Any]:
         expected = self.max_seq + 1

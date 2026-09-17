@@ -72,6 +72,7 @@ export async function connectWebTransport(cfg, onProbe, opts = {}) {
   })();
   return {
     label: `WebTransport (maxDatagramSize ${dg.maxDatagramSize ?? '?'})`,
+    maxDatagramSize: dg.maxDatagramSize ?? null,
     // write() resolves when the datagram has been accepted for sending, so the
     // caller can time how long the browser held it.
     sendProbe: (buf) => writer.write(buf).catch(() => {}),
@@ -119,6 +120,7 @@ export async function connectWebRTC(cfg, onProbe) {
   })));
   return {
     label: 'WebRTC DataChannel (unordered, maxRetransmits 0)',
+    maxDatagramSize: null,
     // send() is synchronous and gives no completion signal, so there is no
     // write time to measure here - bufferedAmount is the queue signal instead.
     sendProbe: (buf) => { probe.send(buf); return null; },
