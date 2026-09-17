@@ -50,10 +50,17 @@ def _rate_stats(bins: List[Dict[str, Any]], key: str = "recv_bps") -> Optional[D
     return _percentiles([b[key] for b in bins if b.get(key) is not None])
 
 
+# Above this the server's event loop is behind, and above the CPU fraction it is
+# simply out of cycles: either way the rate is the receiver's, not the browser's.
+SERVER_LAG_MS = 20.0
+SERVER_CPU_BUSY = 0.85
+
+
 def summarize_saturation(
     up_analysis: Optional[Dict[str, Any]],
     client_offered: Optional[Dict[str, Any]] = None,
     ramp_ms: float = DEFAULT_RAMP_MS,
+    server_load: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Steady-state rate plus the evidence for what limited it."""
     if not up_analysis or not up_analysis.get("timeline"):
@@ -115,6 +122,16 @@ def summarize_saturation(
         "app_packets_missing": app_missing,
         "bins_flagged_quic_limited": flagged,
     }
+    if server_load:
+        lag = _percentiles(server_load.get("loop_lag_ms") or [])
+        cpu = _percentiles(server_load.get("cpu_fraction") or [])
+        out["server_load"] = {
+            "loop_lag_ms": lag,
+            "cpu_fraction": cpu,
+            # aioquic decrypts every packet in Python, so a busy loop here is the
+            # most likely explanation for a rate that looks like a browser limit.
+            "server_busy": bool((lag and lag["p95"] > SERVER_LAG_MS) or (cpu and cpu["p95"] > SERVER_CPU_BUSY)),
+        }
     out["verdict"] = _verdict(out)
     return out
 
@@ -129,6 +146,30 @@ def _verdict(s: Dict[str, Any]) -> Dict[str, Any]:
 
     local_frac = local / offered if offered else None
     net_frac = net / (delivered + net) if (delivered + net) else None
+
+    load = s.get("server_load") or {}
+    if load.get("server_busy"):
+        lag = (load.get("loop_lag_ms") or {}).get("p95")
+        cpu = (load.get("cpu_fraction") or {}).get("p95")
+        # Name only the thing that actually tripped, so the sentence cannot end
+        # up citing a 0 ms lag as evidence.
+        reasons = []
+        if lag is not None and lag > SERVER_LAG_MS:
+            reasons.append(f"its event loop fell behind by up to {lag:.0f} ms")
+        if cpu is not None and cpu > SERVER_CPU_BUSY:
+            reasons.append(f"it spent {100 * cpu:.0f}% of the run pinned on CPU")
+        return {
+            "limited_by": "server",
+            "explanation": (
+                f"This server could not keep up: {' and '.join(reasons)}. aioquic decrypts "
+                "every packet in Python, which costs far more per packet than the kernel's TCP path, so a "
+                "datagram rate measured against it is the *server's* ceiling, not the browser's. Compare "
+                "against a server that is not the bottleneck before concluding anything about the browser."
+            ),
+            "steady_rate_bps": steady,
+            "local_drop_fraction": local_frac,
+            "network_loss_fraction": net_frac,
+        }
 
     if offered and delivered and local < 0.001 * offered and net < 0.001 * delivered:
         who = "sender"

@@ -91,6 +91,8 @@ class Session:
         self._rtt_task: Optional[asyncio.Task] = None
         self.up_quic_samples: list = []
         self._sat_task: Optional[asyncio.Task] = None
+        self.loop_lag_ms: list = []
+        self.cpu_fraction: list = []
         self._up_task: Optional[asyncio.Task] = None
         self.start_ms: Optional[float] = None
         self._task: Optional[asyncio.Task] = None
@@ -277,8 +279,18 @@ class Session:
         """
         interval = float(cfg.get("progress_ms", 500)) / 1000
         last = now_ms()
+        loop = asyncio.get_event_loop()
         while not self.closed:
+            # Event-loop lag and CPU: a Python QUIC receiver is expensive per
+            # packet, and a server that cannot keep up looks exactly like a slow
+            # path from the browser's side. Measuring it here is the only way to
+            # tell "the browser's CC stopped at this rate" from "our server did".
+            before, cpu_before = loop.time(), time.process_time()
             await asyncio.sleep(interval)
+            lag_ms = max(0.0, (loop.time() - before - interval) * 1000)
+            cpu_frac = (time.process_time() - cpu_before) / max(1e-9, loop.time() - before)
+            self.loop_lag_ms.append(lag_ms)
+            self.cpu_fraction.append(cpu_frac)
             t = now_ms()
             if self.up.records is None:
                 continue
@@ -290,6 +302,8 @@ class Session:
                 **win,
                 "quic": self._quic_state(),
                 "packets_total": self.up.received,
+                "server_loop_lag_ms": lag_ms,
+                "server_cpu_fraction": cpu_frac,
             })
 
     def _quic_state(self) -> Dict[str, Any]:
@@ -357,6 +371,7 @@ class Session:
             out["saturation"] = summarize_saturation(
                 out["up_analysis"],
                 client_offered=self.config.get("saturate", {}).get("client_offered"),
+                server_load={"loop_lag_ms": self.loop_lag_ms, "cpu_fraction": self.cpu_fraction},
             )
         if self.shaper_stats:
             out["netem"] = self.shaper_stats()

@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import logging
 import os
+import socket
 from typing import Dict, Optional
 
 from aioquic.asyncio import serve
@@ -45,6 +46,7 @@ log = logging.getLogger("server")
 #    max_udp_payload_size. Safari sizes packets to the path MTU (16K on
 #    loopback), so its larger stream writes were dropped and resent forever.
 MAX_UDP_PAYLOAD_SIZE = 1500
+RCVBUF_BYTES = 8 * 1024 * 1024  # receive buffer for high-rate saturation runs
 _QuicTransportParameters = aioquic_connection.QuicTransportParameters
 
 
@@ -237,10 +239,23 @@ async def main() -> None:
     WebTransportProtocol.quic_cc = args.cc
     WebTransportProtocol.netem = NetemConfig(args.emulate_up_mbps, args.emulate_up_queue_ms, args.emulate_up_loss)
 
-    await serve(args.host, args.port, configuration=config, create_protocol=WebTransportProtocol)
+    server = await serve(args.host, args.port, configuration=config, create_protocol=WebTransportProtocol)
+    # A saturation run can deliver tens of thousands of datagrams a second, and
+    # a Python receiver is not always ready for the next one. The default socket
+    # buffer then overflows and the loss looks exactly like network loss, so ask
+    # for a big one (the kernel may grant less; log what we actually got).
+    rcvbuf = None
+    sock = server._transport.get_extra_info("socket") if getattr(server, "_transport", None) else None
+    if sock is not None:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
+        except OSError:
+            pass
+        rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
     log.info(
-        "listening on udp [%s]:%d, QUIC cc=%s, up emulation: %s",
+        "listening on udp [%s]:%d, QUIC cc=%s, up emulation: %s, rcvbuf %s",
         args.host, args.port, args.cc, WebTransportProtocol.netem.describe(),
+        f"{rcvbuf // 1024} KB" if rcvbuf else "default",
     )
     await asyncio.Future()
 

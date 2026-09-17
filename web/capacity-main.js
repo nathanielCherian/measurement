@@ -35,6 +35,14 @@ const nowMs = () => performance.timeOrigin + performance.now();
 // of writes that have not resolved yet. This is the depth of that window: big
 // enough to keep the transport busy, small enough that we are not the queue.
 const DEFAULT_PENDING = 64;
+// The window must never be the thing we measure. A fixed window of N packets
+// caps the rate at N * size * 8 / (write completion time): 64 x 1000 B against a
+// 17 ms path is 30 Mbps, which looks exactly like a congestion-control ceiling
+// and is not one. So the window grows whenever it is the binding constraint -
+// stalling with no sign that the browser is dropping anything - until either
+// something does start dropping or it hits the cap.
+const MAX_PENDING = 4096;
+const WINDOW_GROW_AFTER_STALLS = 50;
 const OFFER_SAMPLE_MS = 250;
 // Saturation is not polite: cap the run so a phone on a metered link cannot
 // burn through data because a tab was left open.
@@ -42,6 +50,7 @@ const MAX_DURATION_S = 120;
 
 let lastResults = null;
 let stopRun = false;
+let tcpComparison = null;   // {bps, url, host, at} from the TCP upload button
 
 if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(location.hostname)) {
   const f = form.elements;
@@ -83,12 +92,15 @@ function ticker(intervalMs) {
 const offer = {
   packets: 0, bytes: 0, accepted: 0, pending: 0, stalls: 0, rejected: 0,
   samples: [],   // [t_s, offered Mbps]
+  writeMs: [],   // how long the transport took to accept each write
+  window: DEFAULT_PENDING,
+  windowGrew: 0,
   start: null,
 };
 
 function resetOffer() {
   Object.assign(offer, { packets: 0, bytes: 0, accepted: 0, pending: 0, stalls: 0, rejected: 0,
-    samples: [], start: null });
+    samples: [], writeMs: [], window: DEFAULT_PENDING, windowGrew: 0, start: null });
 }
 
 // SCTP gives no per-write completion signal, so backpressure there is
@@ -107,9 +119,11 @@ async function blast(conn, cfg) {
   // WebTransport: a write resolves when the datagram is accepted, so the count
   // of unresolved writes is real backpressure. A data channel just buffers, so
   // its own bufferedAmount is the only signal.
+  offer.window = cfg.pending;
   const backpressured = cfg.transport === 'webtransport'
-    ? () => offer.pending >= cfg.pending
+    ? () => offer.pending >= offer.window
     : () => (conn.queue?.() ?? 0) >= BUFFERED_LIMIT;
+  let stallsSinceGrow = 0;
 
   let lastSample = offer.start;
   let bytesAtSample = 0;
@@ -141,7 +155,11 @@ async function blast(conn, cfg) {
         const p = conn.sendProbe(buf);
         if (p && typeof p.then === 'function') {
           offer.pending++;
-          p.then(() => { offer.pending--; offer.accepted++; }, () => { offer.pending--; });
+          const w0 = nowMs();
+          p.then(() => {
+            offer.pending--; offer.accepted++;
+            if (offer.writeMs.length < 200000) offer.writeMs.push(nowMs() - w0);
+          }, () => { offer.pending--; });
         } else {
           offer.accepted++;    // data channel: send() is synchronous
         }
@@ -150,7 +168,18 @@ async function blast(conn, cfg) {
       }
       thisTick++;
     }
-    if (backpressured()) offer.stalls++;
+    if (backpressured()) {
+      offer.stalls++;
+      // Growing the window is only right while nothing is being dropped: once
+      // the browser starts discarding datagrams we have found its ceiling and a
+      // deeper window would just queue more.
+      if (cfg.transport === 'webtransport' && ++stallsSinceGrow >= WINDOW_GROW_AFTER_STALLS
+          && offer.window < MAX_PENDING) {
+        offer.window = Math.min(MAX_PENDING, offer.window * 2);
+        offer.windowGrew++;
+        stallsSinceGrow = 0;
+      }
+    }
 
     if (t - lastSample >= OFFER_SAMPLE_MS) {
       const dt = t - lastSample;
@@ -174,6 +203,15 @@ async function blast(conn, cfg) {
     rejected_writes: offer.rejected,
     offered_bps: (offer.bytes * 8 * 1000) / elapsed,
     write_stall_ticks: offer.stalls,
+    write_ms: percentiles(offer.writeMs),
+    final_window: offer.window,
+    window_doublings: offer.windowGrew,
+    // What a window of this depth could ever sustain, given how long writes
+    // took to be accepted: if the measured rate is close to this, the window
+    // was the limit and the run says nothing about the browser's CC.
+    window_ceiling_bps: percentiles(offer.writeMs)?.p50
+      ? (offer.window * cfg.size * 8) / (percentiles(offer.writeMs).p50 / 1000)
+      : null,
     duration_ms: elapsed,
     packet_size: cfg.size,
     steps: cfg.mode === 'ramp' ? cfg.steps : null,
@@ -236,6 +274,11 @@ async function run(cfg) {
     user_agent: navigator.userAgent,
     client: sendResult,
     progress,
+    tcp_comparison: tcpComparison,
+    hosts: {
+      datagram: hostOf(cfg.transport === 'webtransport' ? cfg.url : cfg.signalUrl),
+      tcp: tcpComparison ? tcpComparison.host : null,
+    },
     server: serverReport,
   };
   lastResults = results;
@@ -264,9 +307,19 @@ async function runTcpComparison(cfg) {
   } catch { /* aborted */ }
   clearTimeout(stop);
   const bps = (bytes * 8 * 1000) / Math.max(1, nowMs() - t0);
-  log(`TCP upload: ${fmt.mbps(bps)} (${fmt.bytes(bytes)})`);
-  $('tcpResult').textContent = `TCP upload ${fmt.mbps(bps)}`;
+  tcpComparison = { bps, bytes, url: cfg.loadUrl, host: hostOf(cfg.loadUrl), at: new Date().toISOString() };
+  const wtHost = hostOf(cfg.transport === 'webtransport' ? cfg.url : cfg.signalUrl);
+  log(`TCP upload: ${fmt.mbps(bps)} (${fmt.bytes(bytes)}) to ${tcpComparison.host}`);
+  $('tcpResult').textContent = `TCP upload ${fmt.mbps(bps)} to ${tcpComparison.host}`;
+  if (tcpComparison.host !== wtHost) {
+    log(`WARNING: the TCP upload went to ${tcpComparison.host} but the datagram test goes to ${wtHost}. ` +
+        `Those are different paths - the two rates are not comparable.`);
+  }
   return bps;
+}
+
+function hostOf(url) {
+  try { return new URL(url, location.href).host; } catch { return String(url); }
 }
 
 // ---- rendering --------------------------------------------------------------
@@ -316,12 +369,30 @@ function render(r) {
     ['server QUIC srtt p50', fmt.ms(sat?.quic_srtt_p50_ms)],
     ['implied bytes in flight', sat?.implied_cwnd_bytes == null ? '–' : `${(sat.implied_cwnd_bytes / 1024).toFixed(0)} KB`],
     ['bins flagged browser-queued', fmt.n(ana?.bins_flagged_quic_limited), (ana?.bins_flagged_quic_limited ?? 0) > 0],
+    ['server event-loop lag p95', fmt.ms(sat?.server_load?.loop_lag_ms?.p95), sat?.server_load?.server_busy],
+    ['server CPU during run p95', sat?.server_load?.cpu_fraction?.p95 == null ? '–'
+      : `${(100 * sat.server_load.cpu_fraction.p95).toFixed(0)} %`, sat?.server_load?.server_busy],
     ['write-window stalls', fmt.n(c?.write_stall_ticks)],
+    ['write window (final)', `${fmt.n(c?.final_window)} pkts` + (c?.window_doublings ? ` (grew ${c.window_doublings}x)` : '')],
+    ['write accepted after p50 / p95', `${fmt.ms(c?.write_ms?.p50)} / ${fmt.ms(c?.write_ms?.p95)}`],
+    ['window ceiling', fmt.mbps(c?.window_ceiling_bps), windowBound(r)],
     ['data sent', fmt.bytes(c?.offered_bytes)],
   ];
+  if (r.tcp_comparison) {
+    rows.push(['TCP upload, same path', fmt.mbps(r.tcp_comparison.bps),
+      r.hosts?.tcp !== r.hosts?.datagram]);
+  }
   $('stats').innerHTML = tiles(rows);
   drawRateChart();
   $('verdict').innerHTML = verdict(r);
+}
+
+// True when the measured rate is within 20% of what the write window could ever
+// sustain: then the window, not the browser, set the rate.
+function windowBound(r) {
+  const ceiling = r.client?.window_ceiling_bps;
+  const got = r.server?.saturation?.steady_rate_bps?.p50 ?? r.client?.offered_bps;
+  return !!(ceiling && got && got > 0.8 * ceiling);
 }
 
 function verdict(r) {
@@ -332,9 +403,29 @@ function verdict(r) {
     'browser-cc': 'The browser\'s congestion control was the limit',
     path: 'The network path was the limit',
     sender: 'This page was the limit',
+    server: 'The measurement server was the limit',
     unclear: 'Inconclusive',
   }[v.limited_by] ?? 'Inconclusive';
   const parts = [`<p><b>${label}.</b> ${v.explanation ?? ''}</p>`];
+
+  if (windowBound(r)) {
+    parts.push(`<p class="note"><b>Careful:</b> the rate is within 20% of what this page's write window ` +
+      `could sustain (${fmt.mbps(r.client?.window_ceiling_bps)} = ${fmt.n(r.client?.final_window)} packets of ` +
+      `${r.config?.size} B per ${fmt.ms(r.client?.write_ms?.p50)} write). The window, not the browser, may have set ` +
+      `the rate. Raise the pending-write window or the packet size and see whether the number moves.</p>`);
+  }
+  if (r.tcp_comparison && r.hosts?.tcp !== r.hosts?.datagram) {
+    parts.push(`<p class="note"><b>The TCP comparison is not comparable:</b> it uploaded to ` +
+      `<code>${r.hosts.tcp}</code> while the datagrams went to <code>${r.hosts.datagram}</code>. Point both at the ` +
+      `same host before reading anything into the difference.</p>`);
+  } else if (r.tcp_comparison) {
+    const ratio = r.tcp_comparison.bps / (sat.steady_rate_bps?.p50 || 1);
+    parts.push(`<p class="note">TCP upload over the same path reached ${fmt.mbps(r.tcp_comparison.bps)}, ` +
+      `${ratio.toFixed(1)}x the datagram rate. A large gap is expected to some degree: TCP hands the kernel megabytes ` +
+      `at a time and segmentation offload does the rest, while every datagram here is a separate JavaScript write, ` +
+      `QUIC frame and UDP send, capped at maxDatagramSize (~1.2 KB). Per-packet cost, not congestion control, is often ` +
+      `the difference - check whether packets were dropped inside the browser above before blaming its CC.</p>`);
+  }
   parts.push(`<p class="note">Steady state ${fmt.mbps(sat.steady_rate_bps?.p50)} ` +
     `(p25 ${fmt.mbps(sat.steady_rate_bps?.p25)}, p95 ${fmt.mbps(sat.steady_rate_bps?.p95)}) over ` +
     `${sat.steady_bins} bins of ${sat.bin_ms} ms, after skipping the first ${(sat.ramp_ms / 1000).toFixed(1)} s of ramp. ` +

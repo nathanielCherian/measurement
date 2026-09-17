@@ -219,6 +219,25 @@ offered packets dropped inside the browser against 0.11% network loss, implied 9
 82.7 ms RTT. Ramp mode on the same link pinned delivered at 9.71 Mbps while offered climbed to
 32 Mbps, and the RTT chart showed the queue filling at exactly the knee.
 
+**Datagrams are not TCP, and the gap is mostly per-packet cost.** A TCP upload hands the kernel
+megabytes at a time and segmentation offload does the rest; every datagram here is a separate
+JavaScript write, QUIC frame and UDP send, capped at Chrome's `maxDatagramSize` (~1.2 KB). Expect a
+large ratio even when nothing is congestion limited — and check *where* the limit was before
+blaming the browser's CC. Three traps the page now detects for you:
+
+- **The write window.** A fixed window of N unresolved writes caps the rate at `N x size x 8 /
+  write-completion-time` — 64 x 1000 B against a 17 ms path is exactly 30 Mbps, which looks like a
+  CC ceiling and is not one. The window now doubles whenever it is the binding constraint and
+  nothing is being dropped, and the report carries `window_ceiling_bps` so you can see if you were
+  near it.
+- **This Python server.** aioquic decrypts every packet in Python. The session now samples its own
+  event-loop lag and CPU during the run, and the verdict says *"the measurement server was the
+  limit"* when either is pegged. Measured locally: Chrome delivered 115.8 Mbps with the server at
+  **100% CPU** — that number is aioquic's ceiling, not Chrome's. The listening socket also asks for
+  an 8 MB receive buffer, or the overflow would show up as fake network loss.
+- **Comparing two different paths.** The TCP button records the host it uploaded to, and the page
+  refuses to compare when it differs from the host the datagrams went to.
+
 Caveats: this saturates the uplink (a phone on 5G burns real data — runs are capped at 120 s and the
 page says so); Chrome's `maxDatagramSize` is ~1024 B, so larger packet sizes are clamped; and per
 -packet records are capped server-side (`MAX_RECORDS`) with the 100 ms bins carrying the analysis.
