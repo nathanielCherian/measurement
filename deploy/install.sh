@@ -14,6 +14,7 @@ set -euo pipefail
 DOMAIN=${1:?usage: sudo deploy/install.sh <domain> <acme-email> [udp-port]}
 EMAIL=${2:?usage: sudo deploy/install.sh <domain> <acme-email> [udp-port]}
 PORT=${3:-4433}
+RTC_PORT=${4:-8080}
 
 die() { echo "error: $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "run with sudo"
@@ -43,7 +44,7 @@ fi
 render() {
   sed -e "s|@DOMAIN@|$DOMAIN|g" -e "s|@PORT@|$PORT|g" -e "s|@WEB_ROOT@|$WEB_ROOT|g" \
       -e "s|@ACME_ROOT@|$ACME_ROOT|g" -e "s|@REPO@|$REPO|g" -e "s|@RUN_USER@|$RUN_USER|g" \
-      -e "s|@RUN_GROUP@|$RUN_GROUP|g" "$1" > "$2"
+      -e "s|@RUN_GROUP@|$RUN_GROUP|g" -e "s|@RTC_PORT@|$RTC_PORT|g" "$1" > "$2"
 }
 
 # Install an nginx site from a template, test the whole config, reload.
@@ -82,6 +83,8 @@ if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow 80/tcp
   ufw allow 443/tcp
   ufw allow "$PORT/udp"
+  # WebRTC media uses ephemeral UDP ports chosen by ICE.
+  ufw allow 32768:60999/udp
 else
   echo "    ufw inactive; make sure TCP 80,443 and UDP $PORT are open (incl. any external firewall)"
 fi
@@ -105,8 +108,11 @@ chmod 755 "$HOOK"
 
 echo "==> systemd"
 render "$DEPLOY/browser-cc-probe.service" /etc/systemd/system/browser-cc-probe.service
+render "$DEPLOY/browser-cc-rtc.service" /etc/systemd/system/browser-cc-rtc.service
 systemctl daemon-reload
 systemctl enable browser-cc-probe.service
+systemctl enable browser-cc-rtc.service
+systemctl restart browser-cc-rtc.service
 # The hook copies the cert and restarts the service if it is already running.
 RENEWED_LINEAGE=$LIVE "$HOOK"
 systemctl is-active --quiet browser-cc-probe.service || systemctl start browser-cc-probe.service
@@ -114,4 +120,4 @@ systemctl is-active --quiet browser-cc-probe.service || systemctl start browser-
 sleep 1
 systemctl --no-pager --lines=5 status browser-cc-probe.service || true
 echo
-echo "done: open https://$DOMAIN/  (WebTransport server: https://$DOMAIN:$PORT/probe)"
+echo "done: open https://$DOMAIN/  (WebTransport: https://$DOMAIN:$PORT/probe, WebRTC: https://$DOMAIN/rtc.html)"

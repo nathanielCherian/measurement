@@ -2,11 +2,15 @@
 // Mirrors server/transport_stats.py.
 
 export const REORDER_THRESHOLD = 3;
+export const MIN_LOSS_TIMEOUT_MS = 25;
 export const BIN_MS = 100;
 
 export class SenderCore {
-  constructor(cc, keepRecords = true, maxRecords = Infinity) {
+  constructor(cc, keepRecords = true, maxRecords = Infinity, ackDelayBudgetMs = 0) {
     this.cc = cc;
+    // A block-ACK receiver holds packets for up to its ACK interval; without
+    // allowing for that the sender reports spurious loss.
+    this.minTimeoutMs = MIN_LOSS_TIMEOUT_MS + 2 * ackDelayBudgetMs;
     this.nextSeq = 0;
     this.unacked = new Map(); // seq -> [sendTs, size], insertion (= seq) order
     this.inflightBytes = 0;
@@ -110,8 +114,8 @@ export class SenderCore {
 
   checkTimeouts(now) {
     const threshold = this.srtt === null
-      ? 1000
-      : Math.max(2 * this.srtt, this.srtt + 4 * this.rttvar, 25);
+      ? Math.max(1000, this.minTimeoutMs)
+      : Math.max(2 * this.srtt, this.srtt + 4 * this.rttvar, this.minTimeoutMs);
     const lost = [];
     for (const [s, [ts]] of this.unacked) {
       if (now - ts > threshold) lost.push(s); else break;

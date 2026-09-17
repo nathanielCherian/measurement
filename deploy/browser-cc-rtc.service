@@ -1,0 +1,16 @@
+[Unit]
+Description=browser-cc-test WebRTC DataChannel probe server (signaling on TCP @RTC_PORT@)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@RUN_USER@
+WorkingDirectory=@REPO@/server
+Environment="RTC_ARGS="
+EnvironmentFile=-/etc/default/browser-cc-rtc
+ExecStart=@REPO@/server/.venv/bin/python rtc_server.py --host 127.0.0.1 --port @RTC_PORT@ $RTC_ARGS
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

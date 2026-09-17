@@ -8,14 +8,23 @@ from appcc.base import CongestionController
 
 REORDER_THRESHOLD = 3  # packets
 BIN_MS = 100
+MIN_LOSS_TIMEOUT_MS = 25
 
 
 class SenderCore:
     """Tracks sent-but-unacked packets, estimates RTT, declares losses
     (packet-reordering threshold or timeout) and drives the controller."""
 
-    def __init__(self, cc: CongestionController, keep_records: bool = True) -> None:
+    def __init__(
+        self,
+        cc: CongestionController,
+        keep_records: bool = True,
+        ack_delay_budget_ms: float = 0.0,
+    ) -> None:
         self.cc = cc
+        # A block-ACK receiver holds packets for up to its ACK interval, so the
+        # timeout has to allow for that or every run reports spurious loss.
+        self.min_timeout_ms = MIN_LOSS_TIMEOUT_MS + 2 * ack_delay_budget_ms
         self.next_seq = 0
         self.unacked: "OrderedDict[int, tuple]" = OrderedDict()  # seq -> (send_ts, size)
         self.inflight_bytes = 0
@@ -114,9 +123,9 @@ class SenderCore:
 
     def check_timeouts(self, now: float) -> None:
         if self.srtt is None:
-            threshold = 1000.0
+            threshold = max(1000.0, self.min_timeout_ms)
         else:
-            threshold = max(2 * self.srtt, self.srtt + 4 * self.rttvar, 25.0)
+            threshold = max(2 * self.srtt, self.srtt + 4 * self.rttvar, self.min_timeout_ms)
         lost = []
         for s, (ts, _) in self.unacked.items():
             if now - ts > threshold:

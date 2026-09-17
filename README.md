@@ -82,6 +82,34 @@ The interface is the same on both sides:
 `onPacketSent`, `onAck(rtt, srtt, minRtt)`, `onLoss(seqs)`, `pacingRateBps()`, `cwndBytes()`.
 Loss is detected in `SenderCore` in `transport_stats.py` / `stats.js`, by reordering (3 packets) or by timeout.
 
+## WebRTC DataChannel version
+
+`web/rtc.html` runs the same experiment over an unordered, non-retransmitting **data channel**
+instead of WebTransport datagrams, sharing the probe format, controllers, ACKs and analysis.
+
+```sh
+.venv/bin/python rtc_server.py --port 8080   # signaling (HTTP POST /offer); media is UDP via ICE
+```
+Then open `rtc.html` and point "Signaling URL" at it (`/rtc/offer` when deployed behind nginx).
+
+Differences from the WebTransport page:
+- **Signaling instead of certificates:** one HTTP POST exchanges SDP; DTLS is authenticated by the
+  fingerprint inside it, so no CA certificate or cert hash is involved.
+- **SCTP, not QUIC:** `ordered: false, maxRetransmits: 0` gives datagram-like delivery, but SCTP
+  still congestion-controls the channel and adds its own receive-window flow control. Server-side
+  SCTP cwnd, flight size and RTT come from aiortc and are charted.
+- **Backpressure** is `bufferedAmount` on both sides (the page pauses above a configurable limit)
+  rather than QUIC's datagram queue.
+- **Main-thread sending:** `RTCPeerConnection` has no Worker API, so the page sends directly and
+  takes pacing ticks from a small worker (`web/tick-worker.js`) — main-thread timers are throttled
+  in background tabs, which otherwise starves the sender.
+- **No packet-number loss split:** SCTP gives the receiver no equivalent of QUIC packet numbers, so
+  "dropped before send" cannot be separated from network loss; IAT, pacing and delay signals remain.
+- **Control messages are chunked** (16 KB) because data channels cap a single message at 64 KB.
+
+Deployment adds `browser-cc-rtc.service` and an nginx `location /rtc/` proxy; ICE needs the
+ephemeral UDP range open (`ufw allow 32768:60999/udp`, added by `deploy/install.sh`).
+
 ## Acknowledgements
 
 The receiver acknowledges probe packets in one of two modes, chosen on the page and used in both directions:
@@ -94,7 +122,8 @@ The receiver acknowledges probe packets in one of two modes, chosen on the page 
     datagrams if needed
 
   The sender takes one RTT sample per ACK (largest newly acked packet, minus the ack delay) and
-  declares loss only inside `[low, largest]`.
+  declares loss only inside `[low, largest]`. The loss timeout allows for the receiver's ACK
+  interval, without which low-rate runs report large spurious losses.
 
 Implementations: `server/ack.py` + `SenderCore.on_ack_block`, and `web/ack.js` +
 `SenderCore.onAckBlock`. Both produce byte-identical ACKs.

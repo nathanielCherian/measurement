@@ -161,7 +161,9 @@ class Session:
         cfg = self.config
         cc_cfg = cfg.get("down_cc") or {"name": "fixed", "params": {"rate_mbps": 1}}
         cc = make_cc(cc_cfg["name"], cc_cfg.get("params", {}))
-        core = self.down = SenderCore(cc)
+        ack_cfg = cfg.get("ack") or {}
+        budget = float(ack_cfg.get("interval_ms", 0)) if ack_cfg.get("mode") == "block" else 0.0
+        core = self.down = SenderCore(cc, ack_delay_budget_ms=budget)
         size = cfg["size"]
         start = last = last_sample = now_ms()
         end = start + float(cfg.get("duration_s", 10)) * 1000

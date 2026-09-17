@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Browser CC Probe</title>
+<title>Browser CC Probe (WebRTC)</title>
 <style>
   :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafafa; --card:#fff; --line:#e3e3e6; --accent:#2563eb; }
   body { font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; padding: 16px; }
@@ -33,12 +33,15 @@
 </head>
 <body>
 <main>
-  <h1>Browser ⇄ server datagram probe (WebTransport)</h1>
-  <p class="note">Same experiment over WebRTC DataChannels: <a href="rtc.html">rtc.html</a></p>
+  <h1>Browser ⇄ server datagram probe (WebRTC DataChannel)</h1>
+  <p class="note">Same probes, controllers and ACKs as the <a href="index.html">WebTransport page</a>,
+    over an unordered, non-retransmitting data channel. SCTP congestion-controls it, so the browser's
+    stack still sits under your controller. Signaling is one HTTP POST; the media path needs no certificate.</p>
 
   <section class="card">
     <form id="form">
-      <label class="wide">Server URL <input name="url" value="https://127.0.0.1:4433/probe"></label>
+      <label class="wide">Signaling URL <input name="signalUrl" value="http://localhost:8080/offer"></label>
+      <label>STUN server (optional) <input name="stunUrl" placeholder="stun:stun.l.google.com:19302"></label>
       <label>Mode
         <select name="mode">
           <option value="up">up (browser → server, JS CC)</option>
@@ -47,12 +50,7 @@
         </select>
       </label>
       <label>Duration (s) <input name="durationS" type="number" value="10" min="1" step="1"></label>
-      <label>Datagram size (bytes) <input name="size" type="number" value="1000" min="64" max="1100"></label>
-      <label>Browser QUIC CC hint
-        <select name="browserCongestionControl">
-          <option>default</option><option>throughput</option><option>low-latency</option>
-        </select>
-      </label>
+      <label>Message size (bytes) <input name="size" type="number" value="1000" min="64" max="1100"></label>
       <label>Up CC (browser) <select name="upCCName"><option>fixed</option><option>aimd</option></select></label>
       <label>Up CC params (JSON) <textarea name="upCCParams">{"rate_mbps": 2}</textarea></label>
       <label>Down CC (server) <select name="downCCName"><option>fixed</option><option>aimd</option></select></label>
@@ -66,8 +64,7 @@
       <label>Block ACK interval (ms) <input name="ackIntervalMs" type="number" value="20" min="1"></label>
       <label>Block ACK every N packets <input name="ackEveryN" type="number" value="16" min="1"></label>
       <label>Queue guard (ms, 0 = off) <input name="queueGuardMs" type="number" value="2000" min="0"></label>
-      <label>outgoingMaxAge (ms, 0 = default) <input name="outgoingMaxAgeMs" type="number" value="100"></label>
-      <label>outgoingHighWaterMark (datagrams) <input name="outgoingHighWaterMark" type="number" value="256"></label>
+      <label>Pause sending above bufferedAmount (bytes) <input name="bufferedLimit" type="number" value="262144" min="1024"></label>
       <div class="row wide">
         <button id="run" type="submit">Run</button>
         <button id="download" type="button" class="secondary" disabled>Download JSON</button>
@@ -76,30 +73,19 @@
     </form>
   </section>
 
-  <section class="card">
-    <div class="stats" id="stats"></div>
-  </section>
+  <section class="card"><div class="stats" id="stats"></div></section>
 
   <section class="card">
     <div class="legend" id="rateLegend"></div>
     <canvas id="rateChart"></canvas>
     <div class="legend" id="rttLegend"></div>
     <canvas id="rttChart"></canvas>
-  </section>
-
-  <section class="card">
-    <h2>Is QUIC congestion control limiting browser → server?</h2>
-    <p class="note">Browser: WebTransport <code>getStats()</code>, where the browser exposes it. Server: analysis of received
-      packets: inter-arrival times, forward delay vs the server's QUIC RTT, and QUIC packet-number vs probe-sequence loss.</p>
-    <div class="stats" id="quicStats"><div class="stat"><span>Run an up or both test</span></div></div>
-    <div class="legend" id="delayLegend"></div>
-    <canvas id="delayChart"></canvas>
-    <div class="legend" id="iatLegend"></div>
-    <canvas id="iatChart"></canvas>
+    <div class="legend" id="sctpLegend"></div>
+    <canvas id="sctpChart"></canvas>
   </section>
 
   <section class="card"><pre id="log"></pre></section>
 </main>
-<script type="module" src="main.js"></script>
+<script type="module" src="rtc-main.js"></script>
 </body>
 </html>

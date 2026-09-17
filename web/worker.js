@@ -193,7 +193,8 @@ async function run(cfg) {
   let upStopped = null;
   if (wantUp) {
     const cc = makeCC(cfg.upCC.name, cfg.upCC.params);
-    upCore = new SenderCore(cc, true, MAX_RECORDS);
+    upCore = new SenderCore(cc, true, MAX_RECORDS,
+      cfg.ack?.mode === 'block' ? (cfg.ack.interval_ms ?? 0) : 0);
     // Standing queue above this ends the run early: the sender is far above the
     // path's capacity and everything after it (ACKs, control messages) is stuck
     // behind the queue.
