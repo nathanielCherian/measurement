@@ -81,6 +81,61 @@ class Control {
   }
 }
 
+// A second WebTransport connection carrying a trickle of probes. It shares the
+// network path with the loaded connection but has its own QUIC send queue and
+// congestion window, so comparing the two RTTs localises any standing queue:
+//   both rise together  -> the queue is on the network path
+//   only the loaded one -> the queue is inside the browser (per connection)
+async function startReferenceProbe(cfg, options, t0) {
+  const transport = new WebTransport(cfg.url, options);
+  await transport.ready;
+  const writer = (typeof transport.datagrams.createWritable === 'function'
+    ? transport.datagrams.createWritable()
+    : transport.datagrams.writable).getWriter();
+  const control = new Control(await transport.createBidirectionalStream());
+  await control.send({
+    type: 'start', mode: 'up', duration_s: cfg.durationS + 5, size: cfg.referenceSize,
+    ack: { mode: 'packet' }, client_time_ms: nowMs(), reference: true,
+  });
+  await control.waitFor('started');
+
+  const core = new SenderCore(makeCC('fixed', { rate_mbps: 0.01 }), true, 5000);
+  const samples = [];
+  let stop = false;
+
+  (async () => {
+    const reader = transport.datagrams.readable.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const t = nowMs();
+        const pkt = proto.decode(value);
+        if (pkt?.type === proto.ACK && pkt.flow === proto.FLOW_UP) core.onAck(t, pkt.seq, pkt.echoSendTs, pkt.recvTs);
+        else if (pkt?.type === proto.ACK_BLOCK && pkt.flow === proto.FLOW_UP) core.onAckBlock(t, pkt);
+      }
+    } catch { /* closed */ }
+  })();
+
+  (async () => {
+    while (!stop) {
+      const t = nowMs();
+      core.checkTimeouts(t);
+      const seq = core.onSend(t, cfg.referenceSize);
+      writer.write(proto.encodeData(proto.FLOW_UP, seq, t, cfg.referenceSize)).catch(() => {});
+      samples.push({ t: t - t0, srtt: core.srtt, minRtt: core.minRtt, sent: core.sent, acked: core.acked });
+      await sleep(cfg.referenceIntervalMs);
+    }
+  })();
+
+  logLine(`reference probe up: 1 packet every ${cfg.referenceIntervalMs} ms on a second connection`);
+  return {
+    samples,
+    summary: () => ({ ...core.summary(), interval_ms: cfg.referenceIntervalMs, size: cfg.referenceSize, timeline: samples }),
+    stop: () => { stop = true; try { transport.close(); } catch { /* already closed */ } },
+  };
+}
+
 async function run(cfg) {
   const options = {};
   if (cfg.certHashB64) {
@@ -170,6 +225,15 @@ async function run(cfg) {
   const started = await control.waitFor('started');
   logLine(`server started: quic_cc=${started.quic_cc}, clock offset ≈ ${(started.server_time_ms - nowMs()).toFixed(1)} ms`);
 
+  let reference = null;
+  if (cfg.reference) {
+    try {
+      reference = await startReferenceProbe(cfg, options, nowMs());
+    } catch (err) {
+      logLine(`reference probe unavailable: ${describeError(err)}`);
+    }
+  }
+
   t0 = nowMs();
   const progressTimer = setInterval(() => {
     const last = wtStats[wtStats.length - 1];
@@ -181,6 +245,7 @@ async function run(cfg) {
         lost: upCore.lost, srtt: upCore.srtt,
       },
       down: wantDown ? { received: down.received, expected: down.maxSeq + 1, bytes: down.bytes, jitter: down.jitter } : null,
+      reference: reference?.samples[reference.samples.length - 1] ?? null,
       wt: last ?? null,
       statsExposed,
       pendingWrites,
@@ -258,6 +323,8 @@ async function run(cfg) {
 
   clearInterval(progressTimer);
   clearInterval(statsTimer);
+  const referenceSummary = reference?.summary() ?? null;
+  reference?.stop();
 
   await control.send({ type: 'finish' });
   const serverReport = await control.waitFor('server_report', CONTROL_TIMEOUT_MS).catch((e) => {
@@ -284,6 +351,7 @@ async function run(cfg) {
       records: down.records, records_truncated: down.recordsTruncated,
     } : null,
     down_done: downDone,
+    reference: referenceSummary,
     webtransport_stats: wtStats,
     browser_quic: summarizeQuicStats(wtStats),
   };

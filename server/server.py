@@ -27,7 +27,7 @@ from aioquic.quic.logger import QuicFileLogger
 
 import quic_instrument
 import quiccc
-from netem import IngressShaper, NetemConfig
+from netem import IngressShaper, NetemConfig, SharedLink
 from session import Session
 
 quic_instrument.install()
@@ -102,13 +102,18 @@ class WebTransportProtocol(QuicConnectionProtocol):
     log_dir = os.path.join(HERE, "logs")
     quic_cc = "null"
     netem = NetemConfig()
+    netem_link = SharedLink()  # one emulated uplink for every connection
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._http: Optional[H3Connection] = None
         self._sessions: Dict[int, Session] = {}
         self._shaper = (
-            IngressShaper(self.netem, lambda data, addr: QuicConnectionProtocol.datagram_received(self, data, addr))
+            IngressShaper(
+                self.netem,
+                lambda data, addr: QuicConnectionProtocol.datagram_received(self, data, addr),
+                self.netem_link,
+            )
             if self.netem.enabled
             else None
         )

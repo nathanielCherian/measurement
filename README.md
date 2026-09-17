@@ -144,6 +144,27 @@ Safety nets in `web/worker.js`:
   the rest), to bound the size of the results upload.
 - The server saves a partial log if the peer disappears mid-run, and caps its own end-of-run wait.
 
+## Where is the queue: browser or network?
+
+The page can open a **reference probe**: a second WebTransport connection to the same server
+carrying one small packet every 50 ms. It shares the network path but has its own QUIC send queue
+and congestion window, so comparing RTTs localises a standing queue:
+
+- **both connections' RTT rises together** -> the queue is on the network path
+- **only the loaded connection's rises** -> the queue is inside the browser
+
+Measured through one shared emulated 10 Mbps uplink (`--emulate-up-mbps 10 --emulate-up-queue-ms 50`)
+with Chrome sending 30 Mbps:
+
+| | RTT p50 |
+|---|---|
+| reference connection (idle) | 44 ms — the emulated network queue |
+| loaded connection | 179 ms |
+| difference | **135 ms queued inside the browser** |
+
+The server-side estimate agrees independently: forward-delay excess 178 ms − QUIC RTT excess ~43 ms
+≈ 135 ms. Turn the probe off on the page when you want the path to yourself.
+
 ## Is the browser's QUIC congestion control limiting the upload?
 
 Each run's results include:

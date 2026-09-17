@@ -116,6 +116,15 @@ function renderQuicFinal(r, s) {
   } else {
     items.push(['browser getStats()', bq.exposed ? 'exposed but empty (all zeros)' : 'not exposed']);
   }
+  const ref = r.reference;
+  if (ref?.rtt_ms) {
+    const gap = (r.up?.rtt_ms?.p50 ?? 0) - ref.rtt_ms.p50;
+    items.push(
+      ['reference RTT p50 / p95 (idle 2nd connection)', `${fmt.ms(ref.rtt_ms.p50)} / ${fmt.ms(ref.rtt_ms.p95)}`],
+      ['loaded − reference RTT p50', fmt.ms(gap), gap > 5],
+      ['standing queue is', gap > 5 ? 'inside the browser' : 'on the network path / none', gap > 5],
+    );
+  }
   if (a) {
     items.push(
       ['server: IAT p50 / p90', `${fmt.ms(a.iat_ms?.p50)} / ${fmt.ms(a.iat_ms?.p90)}`],
@@ -141,6 +150,8 @@ function renderQuicFinal(r, s) {
     { name: 'server: QUIC RTT excess', color: '#16a34a', points: tl.map((b) => [b.t / 1000 + bs / 2, b.quic_rtt_excess_ms]) },
     { name: 'server: local queue (lower bound)', color: '#dc2626', points: tl.map((b) => [b.t / 1000 + bs / 2, b.local_queue_ms_lb]) },
     { name: 'browser: app − QUIC RTT', color: '#9333ea', points: wt.filter((w) => w.populated).map((w) => [w.t / 1000, w.appMinusQuicRtt]) },
+    { name: 'browser: loaded connection srtt', color: '#1d4ed8', points: (r.up?.timeline ?? []).map((p) => [p.t / 1000, p.srtt]) },
+    { name: 'browser: reference connection srtt', color: '#0d9488', points: (ref?.timeline ?? []).map((p) => [p.t / 1000, p.srtt]) },
   ], 'ms');
   drawChart($('iatChart'), $('iatLegend'), [
     { name: 'server: IAT p50', color: '#0891b2', points: tl.map((b) => [b.t / 1000 + bs / 2, b.iat_p50_ms]) },
@@ -176,6 +187,9 @@ form.addEventListener('submit', async (e) => {
     upCC: { name: f.upCCName.value, params: JSON.parse(f.upCCParams.value || '{}') },
     downCC: { name: f.downCCName.value, params: JSON.parse(f.downCCParams.value || '{}') },
     queueGuardMs: Number(f.queueGuardMs.value) || Infinity,
+    reference: f.reference.value === 'on',
+    referenceIntervalMs: Number(f.referenceIntervalMs.value),
+    referenceSize: 100,
     ack: { mode: f.ackMode.value, interval_ms: Number(f.ackIntervalMs.value), every_n: Number(f.ackEveryN.value) },
     outgoingMaxAgeMs: Number(f.outgoingMaxAgeMs.value) || null,
     outgoingHighWaterMark: Number(f.outgoingHighWaterMark.value) || null,
@@ -213,6 +227,7 @@ form.addEventListener('submit', async (e) => {
           ['down jitter', fmt.ms(m.down.jitter)],
         ] : []),
         ['pending datagram writes', fmt.n(m.pendingWrites)],
+        ...(m.reference ? [['reference srtt (idle 2nd connection)', fmt.ms(m.reference.srtt)]] : []),
       ]);
       renderQuicLive(m);
       drawLive();

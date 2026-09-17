@@ -65,6 +65,10 @@
       </label>
       <label>Block ACK interval (ms) <input name="ackIntervalMs" type="number" value="20" min="1"></label>
       <label>Block ACK every N packets <input name="ackEveryN" type="number" value="16" min="1"></label>
+      <label>Reference probe (2nd connection)
+        <select name="reference"><option value="on">on</option><option value="off">off</option></select>
+      </label>
+      <label>Reference interval (ms) <input name="referenceIntervalMs" type="number" value="50" min="10"></label>
       <label>Queue guard (ms, 0 = off) <input name="queueGuardMs" type="number" value="2000" min="0"></label>
       <label>outgoingMaxAge (ms, 0 = default) <input name="outgoingMaxAgeMs" type="number" value="100"></label>
       <label>outgoingHighWaterMark (datagrams) <input name="outgoingHighWaterMark" type="number" value="256"></label>

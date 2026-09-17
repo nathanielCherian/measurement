@@ -292,7 +292,7 @@ class Session:
         if self.closed:
             return
         self.closed = True
-        if not self.saved and (self.up.received or self.down):
+        if not self.saved and not self.config.get("reference") and (self.up.received or self.down):
             # The peer vanished mid-run (common on mobile): keep what we have.
             try:
                 self._save(None)
