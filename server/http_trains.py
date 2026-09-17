@@ -17,8 +17,22 @@ What this measures differently from WebTransport/WebRTC trains:
 * **Request overhead.** Each POST carries headers, so bytes on the wire exceed
   the payload; the implied-rate estimate is a lower bound.
 
+Two shapes:
+
+* ``/trains/post`` - one POST per packet. Simple, but the browser spreads a
+  burst over its connection pool (6 sockets per origin on HTTP/1.1), so the
+  arrivals interleave flows that each have their own congestion window.
+* ``/trains/bulk`` - **one POST per train**: a single request whose body is
+  ``train_len * size`` bytes, so the bytes go back to back down one connection.
+  The server timestamps the body as it arrives, chunk by chunk, which is the
+  closest thing to per-packet arrival times TCP will give an application.
+  Caveats: a chunk is "what one read returned", so the kernel may coalesce
+  several segments into one; and a cold connection is in slow start, so early
+  trains measure congestion-window growth rather than the path.
+
 Endpoints (CORS open):
   POST /trains/post?c=<client>&t=<train>&i=<index>&n=<len>&ts=<send_ms>  body = padding
+  POST /trains/bulk?c=<client>&t=<train>&n=<len>&size=<bytes>&ts=<send_ms>  body = bulk
   GET  /trains/report?c=<client>[&save=1]  -> summary JSON, optionally written to logs/
 """
 
@@ -28,7 +42,7 @@ import json
 import logging
 import os
 import time
-from typing import Dict
+from typing import Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 import protocol as proto
@@ -39,6 +53,11 @@ log = logging.getLogger("http-trains")
 
 _WALL_OFFSET = time.time() - time.monotonic()
 
+# Smaller reads give finer arrival timestamps. The kernel can still coalesce
+# segments, and on loopback the whole body is usually there at once, so bulk
+# dispersion only means something over a real path.
+READ_CHUNK = 4096
+
 CORS = (
     "Access-Control-Allow-Origin: *\r\n"
     "Access-Control-Allow-Headers: content-type\r\n"
@@ -46,11 +65,53 @@ CORS = (
 )
 
 receivers: Dict[str, TrainReceiver] = {}
+bulk_trains: Dict[str, list] = {}  # client -> [{train_id, chunks: [[t, bytes]], ...}]
 connections: Dict[str, Dict[str, int]] = {}  # client -> {peer port: requests}
 
 
 def now_ms() -> float:
     return (time.monotonic() + _WALL_OFFSET) * 1000
+
+
+def summarize_bulk(trains: list) -> Optional[dict]:
+    """Per-train dispersion of a bulk upload, from the chunk arrival times."""
+    if not trains:
+        return None
+    from trains import _percentiles
+
+    per_train = []
+    for t in trains:
+        chunks = t["chunks"]
+        if len(chunks) < 2:
+            per_train.append({**{k: v for k, v in t.items() if k != "chunks"}, "chunks": len(chunks),
+                              "dispersion_ms": None, "implied_rate_bps": None, "iat_ms": []})
+            continue
+        times = [c[0] for c in chunks]
+        dispersion = times[-1] - times[0]
+        # bytes after the first chunk arrived in `dispersion` ms
+        later_bytes = sum(c[1] for c in chunks[1:])
+        per_train.append(
+            {
+                "train_id": t["train_id"],
+                "peer_port": t["peer_port"],
+                "bytes": t["bytes"],
+                "chunks": len(chunks),
+                "chunk_sizes": [c[1] for c in chunks],
+                "dispersion_ms": dispersion,
+                "iat_ms": [times[i] - times[i - 1] for i in range(1, len(times))],
+                "implied_rate_bps": (later_bytes * 8 * 1000 / dispersion) if dispersion else None,
+            }
+        )
+    complete = [t for t in per_train if t["dispersion_ms"]]
+    return {
+        "trains": len(per_train),
+        "connections": len({t["peer_port"] for t in per_train}),
+        "chunks_per_train": _percentiles([float(t["chunks"]) for t in per_train]),
+        "dispersion_ms": _percentiles([t["dispersion_ms"] for t in complete]),
+        "implied_rate_bps": _percentiles([t["implied_rate_bps"] for t in complete]),
+        "iat_ms": _percentiles([x for t in per_train for x in t["iat_ms"]]),
+        "per_train": per_train,
+    }
 
 
 async def handle(reader, writer, log_dir: str) -> None:
@@ -75,7 +136,37 @@ async def handle(reader, writer, log_dir: str) -> None:
             url = urlparse(target)
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
             body_len = int(headers.get("content-length", 0))
-            body = await reader.readexactly(body_len) if body_len else b""
+            if url.path == "/trains/bulk" and body_len:
+                # Timestamp the body as it lands: each read is roughly one
+                # delivery of segments from the kernel.
+                chunks = []
+                remaining = body_len
+                first = None
+                while remaining > 0:
+                    data = await reader.read(min(remaining, READ_CHUNK))
+                    if not data:
+                        break
+                    t = now_ms()
+                    first = first if first is not None else t
+                    chunks.append([t, len(data)])
+                    remaining -= len(data)
+                client = q.get("c", "default")
+                bulk_trains.setdefault(client, []).append(
+                    {
+                        "train_id": int(q.get("t", 0)),
+                        "send_ts": float(q.get("ts", 0.0)),
+                        "bytes": body_len - remaining,
+                        "packets": int(q.get("n", 0)),
+                        "packet_size": int(q.get("size", 0)),
+                        "peer_port": peer[1],
+                        "chunks": chunks,
+                    }
+                )
+                ports = connections.setdefault(client, {})
+                ports[str(peer[1])] = ports.get(str(peer[1]), 0) + 1
+                body = b""
+            else:
+                body = await reader.readexactly(body_len) if body_len else b""
             arrival = now_ms()  # after the whole body is in
 
             if method == "OPTIONS":
@@ -97,6 +188,10 @@ async def handle(reader, writer, log_dir: str) -> None:
                 ports = connections.setdefault(client, {})
                 ports[str(peer[1])] = ports.get(str(peer[1]), 0) + 1
                 writer.write(f"HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\n\r\n".encode())
+            elif method == "POST" and url.path == "/trains/bulk":
+                # The body was already read above only for small requests; for
+                # bulk we re-read it in chunks with timestamps (see below).
+                writer.write(f"HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\n\r\n".encode())
             elif method == "GET" and url.path == "/trains/report":
                 client = q.get("c", "default")
                 rx = receivers.get(client)
@@ -105,6 +200,7 @@ async def handle(reader, writer, log_dir: str) -> None:
                     "client": client,
                     "connections": connections.get(client, {}),
                     "trains": rx.summary() if rx else None,
+                    "bulk": summarize_bulk(bulk_trains.get(client, [])),
                 }
                 if q.get("save") and rx:
                     os.makedirs(log_dir, exist_ok=True)
@@ -115,6 +211,7 @@ async def handle(reader, writer, log_dir: str) -> None:
                     log.info("saved %s", path)
                 receivers.pop(client, None)
                 connections.pop(client, None)
+                bulk_trains.pop(client, None)
                 payload = json.dumps(report).encode()
                 writer.write(
                     f"HTTP/1.1 200 OK\r\n{CORS}Content-Type: application/json\r\n"

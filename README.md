@@ -165,9 +165,22 @@ Validated against the emulated 10 Mbps uplink (`--emulate-up-mbps 10`), Chrome, 
 dispersion **12.4 ms** (theory 12.0), IAT **0.83 ms** (0.80), implied rate **9.7 Mbps**. On an
 unshaped loopback the same trains gave ~46–86 Mbps, i.e. the estimate tracks the bottleneck.
 
-Caveats for the POST transport: the browser spread one train across **6 TCP connections** in
-testing (the report counts them), TCP repairs loss below the measurement, and request headers add
-bytes, so the implied rate is a loose lower bound. It also bypasses the UDP emulator entirely.
+The HTTP transport comes in two shapes, because *how* you send matters:
+
+- **`http-bulk` (one POST per train, recommended):** a single request whose body is
+  `train_len × size` bytes, so the bytes go back to back down **one** connection. The server reads
+  the body in 4 KB chunks and timestamps each read. Verified: 1 connection, 16 reads per 64 KB.
+- **`http-post` (one POST per packet):** the browser spreads the burst over its connection pool —
+  **6 TCP connections** in testing, each with its own congestion window — so arrivals interleave
+  independent flows. The report counts the connections so you can see this.
+
+Both share TCP's caveats: loss is repaired below the measurement, request headers add bytes, and
+on loopback there is no bottleneck to disperse anything (the bulk mode reads 9.3 Gbps, i.e. the
+loopback itself). Run it against a deployed server to measure a real path. They also bypass the UDP
+emulator, which only shapes the WebTransport port.
+
+Deployment adds `browser-cc-http-trains.service` and an nginx `location /trains/` with
+`proxy_request_buffering off`, so bodies stream through instead of being buffered whole.
 
 ## Where is the queue: browser or network?
 

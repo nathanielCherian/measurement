@@ -1,0 +1,14 @@
+[Unit]
+Description=browser-cc-test HTTP packet-train receiver (TCP @HTTP_TRAINS_PORT@)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@RUN_USER@
+WorkingDirectory=@REPO@/server
+ExecStart=@REPO@/server/.venv/bin/python http_trains.py --host 127.0.0.1 --port @HTTP_TRAINS_PORT@
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

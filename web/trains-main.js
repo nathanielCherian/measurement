@@ -256,9 +256,49 @@ async function runPostTrains(cfg) {
   };
 }
 
+// One POST per train: a single request whose body is trainLen * size bytes, so
+// the bytes go back to back down one connection instead of being spread over
+// the browser's connection pool. The server timestamps the body as it arrives.
+async function runBulkTrains(cfg) {
+  const client = `c${Math.random().toString(36).slice(2, 10)}`;
+  const body = new Uint8Array(cfg.trainLen * cfg.size);
+  const tick = ticker(cfg.gapMs);
+  const responseMs = [];
+
+  for (let trainId = 0; trainId < cfg.trains; trainId++) {
+    const t = nowMs();
+    const url = `${cfg.bulkUrl}?c=${client}&t=${trainId}&n=${cfg.trainLen}&size=${cfg.size}&ts=${t}`;
+    try {
+      await fetch(url, { method: 'POST', body });
+      responseMs.push(nowMs() - t);
+    } catch (e) { log(`train ${trainId} failed: ${e}`); }
+    $('status').textContent = `sent ${trainId + 1}/${cfg.trains} bulk trains`;
+    await tick.next();
+  }
+  tick.stop();
+
+  const report = await (await fetch(`${cfg.reportUrl}?c=${client}&save=1`)).json();
+  return {
+    up_send: { trains: cfg.trains, bytes_per_train: body.length, response_ms: percentiles(responseMs) },
+    server: { bulk: report.bulk, connections: report.connections, saved: report.saved },
+  };
+}
+
 // ---- run --------------------------------------------------------------------
 
 async function run(cfg) {
+  if (cfg.transport === 'http-bulk') {
+    const r = await runBulkTrains(cfg);
+    const results = { transport: 'http-bulk', config: cfg, user_agent: navigator.userAgent, ...r };
+    lastResults = results;
+    const b = r.server.bulk;
+    log(`server saw ${b?.connections ?? '?'} TCP connection(s) for ${b?.trains ?? 0} bulk trains` +
+        `${r.server.saved ? `; saved ${r.server.saved}` : ''}`);
+    render(results);
+    $('download').disabled = false;
+    return;
+  }
+
   if (cfg.transport === 'http-post') {
     const r = await runPostTrains(cfg);
     const results = { transport: 'http-post', config: cfg, user_agent: navigator.userAgent, ...r };
@@ -319,6 +359,28 @@ function render(r) {
   const tiles = [];
   const add = (label, value) => tiles.push(`<div class="stat"><b>${value}</b><span>${label}</span></div>`);
 
+  if (r.transport === 'http-bulk') {
+    const b = r.server?.bulk;
+    add('TCP connections used', fmt.n(b?.connections));
+    add('bytes per train', fmt.n(r.up_send?.bytes_per_train));
+    add('reads per train p50 (server)', fmt.n(b?.chunks_per_train?.p50));
+    add('dispersion p50 @server', fmt.ms(b?.dispersion_ms?.p50));
+    add('read IAT p50 / p95', `${fmt.ms(b?.iat_ms?.p50)} / ${fmt.ms(b?.iat_ms?.p95)}`);
+    add('implied rate p50', fmt.mbps(b?.implied_rate_bps?.p50));
+    add('POST response time p50', fmt.ms(r.up_send?.response_ms?.p50));
+    $('stats').innerHTML = tiles.join('');
+    const per = b?.per_train ?? [];
+    drawChart($('dispersionChart'), $('dispersionLegend'), [
+      { name: 'bulk: dispersion per train', color: '#2563eb', points: per.map((t, i) => [i, t.dispersion_ms]) },
+    ], 'ms (x = train #)');
+    drawChart($('rateChart'), $('rateLegend'), [
+      { name: 'bulk: implied rate', color: '#2563eb', points: per.map((t, i) => [i, (t.implied_rate_bps ?? 0) / 1e6]) },
+    ], 'Mbps (x = train #)');
+    drawChart($('iatChart'), $('iatLegend'), [
+      { name: 'bulk: IAT between server reads', color: '#16a34a', points: per.flatMap((t) => (t.iat_ms ?? []).map((v, i) => [t.train_id + i / Math.max(1, t.chunks), v])) },
+    ], 'ms (x = train #)');
+    return;
+  }
   if (r.transport === 'http-post') {
     add('TCP connections used', fmt.n(Object.keys(r.server?.connections ?? {}).length));
     add('POST response time p50', fmt.ms(r.up_send?.response_ms?.p50));
@@ -382,6 +444,7 @@ form.addEventListener('submit', async (e) => {
     url: f.url.value,
     signalUrl: f.signalUrl.value,
     postUrl: f.postUrl.value,
+    bulkUrl: f.postUrl.value.replace(/\/post$/, '/bulk'),
     reportUrl: f.postUrl.value.replace(/\/post$/, '/report'),
     direction: f.direction.value,
     trainLen: Number(f.trainLen.value),

@@ -48,7 +48,8 @@
         <select name="transport">
           <option value="webtransport">WebTransport datagrams</option>
           <option value="webrtc">WebRTC DataChannel</option>
-          <option value="http-post">HTTP POST (TCP)</option>
+          <option value="http-bulk">HTTP POST, one bulk request per train (TCP)</option>
+          <option value="http-post">HTTP POST, one request per packet (TCP)</option>
         </select>
       </label>
       <label>Direction
@@ -61,6 +62,7 @@
       <label class="wide">WebTransport URL <input name="url" value="https://127.0.0.1:4433/probe"></label>
       <label class="wide">WebRTC signaling URL <input name="signalUrl" value="http://localhost:8080/offer"></label>
       <label class="wide">HTTP POST URL <input name="postUrl" value="http://localhost:8081/trains/post"></label>
+      <p class="note wide">Deployed behind nginx this is <code>/trains/post</code> on the same origin.</p>
       <label>Packets per train <input name="trainLen" type="number" value="16" min="2" max="500"></label>
       <label>Number of trains <input name="trains" type="number" value="50" min="1" max="2000"></label>
       <label>Gap between trains (ms) <input name="gapMs" type="number" value="200" min="10"></label>
