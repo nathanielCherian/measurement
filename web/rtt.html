@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTT monitor</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafafa; --card:#fff; --line:#e3e3e6; --accent:#2563eb; }
+  body { font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; padding: 16px; }
+  main { max-width: 1000px; margin: 0 auto; display: grid; gap: 16px; }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 4px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+  form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; }
+  label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+  input, select { font: 13px ui-monospace, monospace; padding: 5px 6px; border: 1px solid var(--line); border-radius: 4px; }
+  .wide { grid-column: 1 / -1; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: #fff; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  pre { margin: 0; font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; max-height: 240px; overflow: auto; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  .stat.flag b { color: #b45309; }
+  canvas { width: 100%; height: 240px; display: block; }
+  .legend { font-size: 12px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  .note { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>RTT monitor (steady timestamped stream)</h1>
+  <p class="note">A thin, steady stream of packets, each carrying the sender's clock reading at the moment it was handed
+    to the transport. The far end turns every packet around immediately, stamping its own arrival time, so one packet gives
+    the round trip (no clock sync needed) <em>and</em> each leg on its own. Clock offsets are unknown but constant, so the
+    legs are read against their own minimum: <b>up leg above its min</b> climbing while the down leg stays flat means the
+    queue is on the uplink. Both ends also parse the timestamps of the stream they receive, giving one-way delay and
+    arrival spacing even if replies never come back. Default load is 10 kbps — it measures delay, it doesn't cause it.
+    Other pages: <a href="index.html">WebTransport probe</a>, <a href="rtc.html">WebRTC probe</a>,
+    <a href="trains.html">packet trains</a>.</p>
+
+  <section class="card">
+    <form id="form">
+      <label>Transport
+        <select name="transport">
+          <option value="webtransport">WebTransport datagrams</option>
+          <option value="webrtc">WebRTC DataChannel</option>
+        </select>
+      </label>
+      <label>Direction
+        <select name="direction">
+          <option value="up">up (browser pings, server echoes)</option>
+          <option value="down">down (server pings, browser echoes)</option>
+          <option value="both">both</option>
+        </select>
+      </label>
+      <label>Interval (ms) <input name="intervalMs" type="number" value="50" min="5" max="5000"></label>
+      <label>Packet size (bytes) <input name="size" type="number" value="64" min="22" max="1100"></label>
+      <label>Duration (s) <input name="durationS" type="number" value="60" min="1" max="3600"></label>
+      <label class="wide">WebTransport URL <input name="url" value="https://127.0.0.1:4433/probe"></label>
+      <label class="wide">WebRTC signaling URL <input name="signalUrl" value="http://localhost:8080/offer"></label>
+      <div class="row wide">
+        <button id="run" type="submit">Run</button>
+        <button id="stop" type="button" class="secondary" disabled>Stop</button>
+        <button id="download" type="button" class="secondary" disabled>Download JSON</button>
+        <span id="status" style="color:var(--muted)"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Load generator</h2>
+    <p class="note">Runs a saturating HTTP transfer to the same server, on top of the probe stream, and can be started and
+      stopped mid-run. If the one-way delay climbs while it runs and drops when it stops, that delay is queueing in the
+      bottleneck (bufferbloat), and the gap tells you how deep the queue is. Upload loads the browser's uplink — the same
+      queue a browser → server experiment has to push through.</p>
+    <form onsubmit="return false">
+      <label class="wide">Load URL base <input name="loadUrl" form="form" value="http://localhost:8081/trains/load"></label>
+      <label>Transfer size per request (MB) <input name="loadBytes" form="form" type="number" value="32" min="1" max="1024"></label>
+      <div class="row wide">
+        <button id="startUpload" type="button">Start upload load</button>
+        <button id="startDownload" type="button">Start download load</button>
+        <button id="stopLoad" type="button" class="secondary">Stop load</button>
+        <span id="loadState" style="color:var(--muted)"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="card"><div class="stats" id="stats"></div></section>
+
+  <section class="card">
+    <h2>Delay over time</h2>
+    <div class="legend" id="delayLegend"></div>
+    <canvas id="delayChart"></canvas>
+    <h2>Load generator</h2>
+    <div class="legend" id="loadLegend"></div>
+    <canvas id="loadChart"></canvas>
+  </section>
+
+  <section class="card" id="verdict"></section>
+
+  <section class="card"><pre id="log"></pre></section>
+</main>
+<script type="module" src="rtt-main.js"></script>
+</body>
+</html>

@@ -182,6 +182,45 @@ emulator, which only shapes the WebTransport port.
 Deployment adds `browser-cc-http-trains.service` and an nginx `location /trains/` with
 `proxy_request_buffering off`, so bodies stream through instead of being buffered whole.
 
+## RTT monitor (`web/rtt.html`)
+
+A thin, steady stream instead of a burst: one small packet every `interval_ms` (default 64 B every
+50 ms, ~10 kbps), each carrying the sender's clock reading at hand-off. The far end turns every
+packet around immediately, stamping its own arrival time, so a single exchange gives
+
+| | |
+|---|---|
+| `rtt` | pong arrival − ping send — one clock, no sync needed |
+| `up leg` | `echo_recv_ts − send_ts` (+ the clock offset) |
+| `down leg` | pong arrival − `echo_recv_ts` (− the clock offset) |
+
+The offset is unknown but constant over a run, so the legs are read **against their own minimum**:
+`up_excess = up − min(up)` is what the forward direction added beyond its best case. A rising
+`up_excess` with a flat `down_excess` puts the queue on the uplink — the ambiguity a single RTT
+number can never resolve.
+
+Both ends also parse the timestamps *inside* the stream they receive (`RttStreamReceiver`), which
+needs no reply at all: one-way delay excess, arrival spacing vs the spacing the sender stamped in,
+RFC 3550 jitter, and loss/reordering from the sequence numbers. If arrival spacing is ragged while
+send spacing is steady, the raggedness happened after hand-off.
+
+Code: `server/rtt.py` and `web/rtt.js` (same classes, same field names), `web/rtt-main.js` for the
+page, `PING`/`PONG` in `protocol.py`/`protocol.js`. Runs over WebTransport datagrams or a WebRTC
+DataChannel; the server side is wired into both `session.py` and `rtc_session.py` via
+`{"rtt": {"direction", "interval_ms", "size", "duration_s"}}` in the `start` message.
+
+### Load generator
+
+The same page can run a **saturating HTTP transfer to the same server**, started and stopped by
+hand while the probe stream keeps going (`POST /trains/load/upload`, `GET /trains/load/download`
+in `http_trains.py`). Delay that appears when the transfer starts and disappears when it stops is
+queueing in the bottleneck — bufferbloat — not a route change, and the gap between loaded and
+unloaded delay measures how deep that queue is. Load start/stop marks and throughput samples are
+saved with the run, and both charts share an x axis so they line up.
+
+Upload load is the interesting one for this project: it fills the same uplink queue a
+browser → server congestion-control experiment has to push through.
+
 ## Where is the queue: browser or network?
 
 The page can open a **reference probe**: a second WebTransport connection to the same server

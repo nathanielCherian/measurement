@@ -1,6 +1,8 @@
 // Minimal multi-series line chart shared by the WebTransport and WebRTC pages.
 // Minimal multi-series line chart. series: [{name, color, points: [[x, y]]}]
-export function drawChart(canvas, legend, series, yLabel) {
+// `xMax` pins the x axis so several charts of the same run line up; omit it to
+// scale to the data.
+export function drawChart(canvas, legend, series, yLabel, xMax = null) {
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth, h = canvas.clientHeight;
   canvas.width = w * dpr; canvas.height = h * dpr;
@@ -11,7 +13,7 @@ export function drawChart(canvas, legend, series, yLabel) {
   const all = series.flatMap((s) => s.points).filter(([, y]) => Number.isFinite(y));
   legend.innerHTML = series.map((s) => `<span><i style="background:${s.color}"></i>${s.name}</span>`).join('');
   if (!all.length) return;
-  const xMax = Math.max(...all.map((p) => p[0]), 1);
+  xMax = xMax ?? Math.max(...all.map((p) => p[0]), 1);
   const yMax = Math.max(...all.map((p) => p[1]), 1e-9) * 1.1;
   const X = (x) => pad.l + (x / xMax) * (w - pad.l - pad.r);
   const Y = (y) => h - pad.b - (y / yMax) * (h - pad.t - pad.b);

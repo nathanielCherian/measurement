@@ -9,6 +9,7 @@
 
 import { drawChart } from './chart.js';
 import * as proto from './protocol.js';
+import { connectWebRTC, connectWebTransport } from './transport.js';
 
 const $ = (id) => document.getElementById(id);
 const form = $('form');
@@ -130,104 +131,10 @@ async function sendTrains(send, cfg, onTrain) {
 }
 
 // ---- transports -------------------------------------------------------------
-// Both return { sendProbe, onProbe, sendControl, waitFor, close }.
-
-function ndjsonControl(sendRaw) {
-  const waiters = new Map();
-  const inbox = [];
-  let buf = '';
-  return {
-    feed(text) {
-      buf += text;
-      let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i); buf = buf.slice(i + 1);
-        if (!line.trim()) continue;
-        const msg = JSON.parse(line);
-        const w = waiters.get(msg.type);
-        if (w) { waiters.delete(msg.type); w(msg); } else inbox.push(msg);
-      }
-    },
-    send(msg) { sendRaw(JSON.stringify(msg) + '\n'); },
-    waitFor(type, timeoutMs = 30000) {
-      const idx = inbox.findIndex((m) => m.type === type);
-      if (idx >= 0) return Promise.resolve(inbox.splice(idx, 1)[0]);
-      return new Promise((resolve, reject) => {
-        const t = setTimeout(() => { waiters.delete(type); reject(new Error(`timeout waiting for ${type}`)); }, timeoutMs);
-        waiters.set(type, (m) => { clearTimeout(t); resolve(m); });
-      });
-    },
-  };
-}
-
-async function connectWebTransport(cfg, onProbe) {
-  const options = {};
-  try {
-    const hash = (await (await fetch('cert-hash.json', { cache: 'no-store' })).json()).sha256_b64;
-    options.serverCertificateHashes = [{ algorithm: 'sha-256', value: Uint8Array.from(atob(hash), (c) => c.charCodeAt(0)) }];
-  } catch { /* CA-signed cert */ }
-  const transport = new WebTransport(cfg.url, options);
-  await transport.ready;
-  const dg = transport.datagrams;
-  if ('outgoingHighWaterMark' in dg) dg.outgoingHighWaterMark = 1024; // never drop trains locally
-  const writer = (typeof dg.createWritable === 'function' ? dg.createWritable() : dg.writable).getWriter();
-  const stream = await transport.createBidirectionalStream();
-  const streamWriter = stream.writable.getWriter();
-  const control = ndjsonControl((text) => streamWriter.write(new TextEncoder().encode(text)));
-  (async () => {
-    const reader = stream.readable.pipeThrough(new TextDecoderStream()).getReader();
-    try { for (;;) { const { value, done } = await reader.read(); if (done) break; control.feed(value); } } catch { /* closed */ }
-  })();
-  (async () => {
-    const reader = dg.readable.getReader();
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        onProbe(proto.decode(value), nowMs());
-      }
-    } catch { /* closed */ }
-  })();
-  return {
-    label: `WebTransport (maxDatagramSize ${dg.maxDatagramSize ?? '?'})`,
-    sendProbe: (buf) => writer.write(buf).catch(() => {}),
-    control,
-    close: () => transport.close(),
-  };
-}
-
-async function connectWebRTC(cfg, onProbe) {
-  const pc = new RTCPeerConnection({ iceServers: [] });
-  const controlCh = pc.createDataChannel('control', { ordered: true });
-  const probe = pc.createDataChannel('probe', { ordered: false, maxRetransmits: 0 });
-  probe.binaryType = 'arraybuffer';
-  const control = ndjsonControl((text) => controlCh.send(text));
-  controlCh.onmessage = (e) => control.feed(typeof e.data === 'string' ? e.data : new TextDecoder().decode(e.data));
-  probe.onmessage = (e) => onProbe(proto.decode(new Uint8Array(e.data)), nowMs());
-
-  await pc.setLocalDescription(await pc.createOffer());
-  await new Promise((resolve) => {
-    if (pc.iceGatheringState === 'complete') return resolve();
-    pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && resolve();
-    setTimeout(resolve, 3000);
-  });
-  const answer = await (await fetch(cfg.signalUrl, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
-  })).json();
-  await pc.setRemoteDescription(answer);
-  await Promise.all([controlCh, probe].map((ch) => new Promise((resolve, reject) => {
-    if (ch.readyState === 'open') return resolve();
-    ch.onopen = resolve;
-    ch.onerror = () => reject(new Error(`channel ${ch.label} failed`));
-  })));
-  return {
-    label: 'WebRTC DataChannel (unordered, maxRetransmits 0)',
-    sendProbe: (buf) => probe.send(buf),
-    control,
-    close: () => pc.close(),
-  };
-}
+// connectWebTransport / connectWebRTC live in transport.js (shared with the RTT
+// monitor page). Trains want a deep local datagram queue: a burst must not be
+// dropped by the browser before it reaches the wire.
+const TRAIN_WT_OPTS = { highWaterMark: 1024 };
 
 // ---- HTTP POST trains -------------------------------------------------------
 // The TCP counterpart: each "packet" is a POST, timestamped at the server when
@@ -323,7 +230,7 @@ async function run(cfg) {
 
   const down = new TrainReceiver();
   const conn = cfg.transport === 'webtransport'
-    ? await connectWebTransport(cfg, (pkt, t) => { if (pkt?.type === proto.TRAIN && pkt.flow === proto.FLOW_DOWN) down.onPacket(pkt, t); })
+    ? await connectWebTransport(cfg, (pkt, t) => { if (pkt?.type === proto.TRAIN && pkt.flow === proto.FLOW_DOWN) down.onPacket(pkt, t); }, TRAIN_WT_OPTS)
     : await connectWebRTC(cfg, (pkt, t) => { if (pkt?.type === proto.TRAIN && pkt.flow === proto.FLOW_DOWN) down.onPacket(pkt, t); });
   log(`connected: ${conn.label}`);
 

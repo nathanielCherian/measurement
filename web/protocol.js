@@ -10,7 +10,12 @@ export const DATA = 1;
 export const ACK = 2;
 export const ACK_BLOCK = 3;
 export const TRAIN = 4;
+// PING: type u8 | flow u8 | seq u32 | send_ts f64 | 0 f64 | padding
+// PONG: type u8 | flow u8 | seq u32 | send_ts f64 (echoed) | echo_recv_ts f64
+export const PING = 5;
+export const PONG = 6;
 export const TRAIN_HEADER_SIZE = 16;
+export const ECHO_HEADER_SIZE = 22;
 export const MAX_ACK_RANGES = 16;
 export const MAX_DATAGRAM_PAYLOAD = 1000;
 const BLOCK_HEAD_SIZE = 27;
@@ -28,6 +33,20 @@ export function encodeTrain(flow, trainId, index, trainLen, sendTs, size) {
   v.setFloat64(8, sendTs);
   return buf;
 }
+
+function encodeEcho(type, flow, seq, sendTs, echoRecvTs, size) {
+  const buf = new Uint8Array(Math.max(size, ECHO_HEADER_SIZE));
+  const v = new DataView(buf.buffer);
+  v.setUint8(0, type); v.setUint8(1, flow); v.setUint32(2, seq >>> 0);
+  v.setFloat64(6, sendTs); v.setFloat64(14, echoRecvTs);
+  return buf;
+}
+
+export const encodePing = (flow, seq, sendTs, size = ECHO_HEADER_SIZE) =>
+  encodeEcho(PING, flow, seq, sendTs, 0, size);
+
+export const encodePong = (flow, seq, sendTs, echoRecvTs, size = ECHO_HEADER_SIZE) =>
+  encodeEcho(PONG, flow, seq, sendTs, echoRecvTs, size);
 
 export function encodeAckBlock(flow, ackId, largest, largestRecvTs, ackDelayMs, low, ranges, timestamps) {
   const buf = new Uint8Array(BLOCK_HEAD_SIZE + ranges.length * 8 + 2 + timestamps.length * 8);
@@ -73,6 +92,12 @@ export function decode(bytes) {
   }
   if (bytes.byteLength >= ACK_SIZE && bytes[0] === ACK) {
     return { type: ACK, flow: v.getUint8(1), seq: v.getUint32(2), echoSendTs: v.getFloat64(6), recvTs: v.getFloat64(14) };
+  }
+  if (bytes.byteLength >= ECHO_HEADER_SIZE && (bytes[0] === PING || bytes[0] === PONG)) {
+    return {
+      type: bytes[0], flow: v.getUint8(1), seq: v.getUint32(2),
+      sendTs: v.getFloat64(6), echoRecvTs: v.getFloat64(14), size: bytes.byteLength,
+    };
   }
   if (bytes.byteLength >= TRAIN_HEADER_SIZE && bytes[0] === TRAIN) {
     return {

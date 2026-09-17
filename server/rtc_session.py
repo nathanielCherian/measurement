@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import protocol as proto
 from ack import AckGenerator
 from appcc import make_cc
+from rtt import RttMonitor, RttStreamReceiver, run_rtt_stream
 from trains import TrainReceiver, send_trains
 from transport_stats import ReceiverStats, SenderCore
 from up_analysis import analyze_up
@@ -63,6 +64,11 @@ class RtcSession:
         self.up_acks: Optional[AckGenerator] = None
         self.up_trains = TrainReceiver()
         self._trains_task: Optional[asyncio.Task] = None
+        # RTT monitor (rtt.py): the browser's PING stream is parsed here and
+        # echoed back; a server-initiated stream is tracked by down_rtt.
+        self.up_rtt = RttStreamReceiver()
+        self.down_rtt = RttMonitor()
+        self._rtt_task: Optional[asyncio.Task] = None
         self.up_sctp_samples: List[Dict[str, Any]] = []
         self._task: Optional[asyncio.Task] = None
         self._up_task: Optional[asyncio.Task] = None
@@ -113,6 +119,9 @@ class RtcSession:
             trains_cfg = msg.get("trains")
             if trains_cfg and trains_cfg.get("direction") in ("down", "both"):
                 self._trains_task = asyncio.ensure_future(self._run_trains(trains_cfg))
+            rtt_cfg = msg.get("rtt")
+            if rtt_cfg and rtt_cfg.get("direction") in ("down", "both"):
+                self._rtt_task = asyncio.ensure_future(self._run_rtt(rtt_cfg))
             if msg.get("mode") in ("down", "both"):
                 self._task = asyncio.ensure_future(self._run_down())
             if msg.get("mode") in ("up", "both"):
@@ -145,6 +154,12 @@ class RtcSession:
                 self.up_acks.on_packet(pkt.seq, pkt.send_ts, t)
         elif isinstance(pkt, proto.Train) and pkt.flow == proto.FLOW_UP:
             self.up_trains.on_packet(pkt, t)
+        elif isinstance(pkt, proto.Ping) and pkt.flow == proto.FLOW_UP:
+            # Echo first: anything we do before this lands in the browser's RTT.
+            self._send_probe(proto.encode_pong(pkt.flow, pkt.seq, pkt.send_ts, t))
+            self.up_rtt.on_ping(pkt, t)
+        elif isinstance(pkt, proto.Pong) and pkt.flow == proto.FLOW_DOWN:
+            self.down_rtt.on_pong(pkt, t)
         elif isinstance(pkt, proto.Ack) and pkt.flow == proto.FLOW_DOWN and self.down:
             self.down.on_ack(t, pkt.seq, pkt.echo_send_ts, pkt.recv_ts)
         elif isinstance(pkt, proto.AckBlock) and pkt.flow == proto.FLOW_DOWN and self.down:
@@ -246,12 +261,31 @@ class RtcSession:
         )
         self.send_control({"type": "trains_done", **result})
 
+    async def _run_rtt(self, cfg: Dict[str, Any]) -> None:
+        """Steady PING stream browser-ward; the page echoes each one back."""
+        result = await run_rtt_stream(
+            self._send_probe,
+            proto.FLOW_DOWN,
+            now_ms,
+            self.down_rtt,
+            interval_ms=float(cfg.get("interval_ms", 50)),
+            duration_s=float(cfg.get("duration_s", 30)),
+            size=min(int(cfg.get("size", proto.ECHO_HEADER_SIZE)), MAX_SIZE),
+            is_open=lambda: not self.closed,
+        )
+        await asyncio.sleep(min(MAX_GRACE_S, max(0.5, 3 * (self.down_rtt.srtt or 100) / 1000)))
+        self.send_control({"type": "rtt_done", **result})
+
     # ---- reporting -------------------------------------------------------
 
     def report(self, brief: bool) -> Dict[str, Any]:
         out: Dict[str, Any] = {"up": self.up.summary() if self.up.received else None}
         if self.up_trains.packets:
             out["up_trains"] = self.up_trains.summary()
+        if self.up_rtt.received:
+            out["up_rtt"] = self.up_rtt.summary(keep_records=not brief)
+        if self.down_rtt.sent:
+            out["down_rtt"] = self.down_rtt.summary(keep_records=not brief)
         if out["up"] is not None and self.up_acks:
             out["up"]["acks_sent"] = self.up_acks.acks_sent
             out["up"]["ack_mode"] = self.up_acks.mode
@@ -296,12 +330,14 @@ class RtcSession:
         self.closed = True
         if self._trains_task:
             self._trains_task.cancel()
+        if self._rtt_task:
+            self._rtt_task.cancel()
         for task in (self._task, self._up_task):
             if task:
                 task.cancel()
         if self.up_acks:
             self.up_acks.close()
-        if not self.saved and (self.up.received or self.down):
+        if not self.saved and (self.up.received or self.down or self.up_rtt.received):
             try:
                 self._save(None)
             except Exception:  # noqa: BLE001

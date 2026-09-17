@@ -5,6 +5,11 @@ ACK:  type u8 | flow u8 | seq u32 | echo_send_ts f64 | recv_ts f64 (ms, receiver
 TRAIN: type u8 | flow u8 | train_id u16 | index u16 | train_len u16 | send_ts f64 | padding
   A burst of `train_len` packets sent back to back; the receiver measures the
   inter-arrival times (see server/trains.py).
+PING: type u8 | flow u8 | seq u32 | send_ts f64 (sender clock) | 0 f64 | padding
+PONG: type u8 | flow u8 | seq u32 | send_ts f64 (echoed) | echo_recv_ts f64 (responder clock)
+  The steady-stream RTT monitor (server/rtt.py): the responder turns a PING
+  around immediately, stamping its own arrival time, so one exchange gives the
+  round trip *and* each leg separately (up to the clock offset).
 ACK_BLOCK (one datagram acknowledging many packets):
       type u8 | flow u8 | ack_id u32 | largest u32 | largest_recv_ts f64 | ack_delay_ms f32 |
       low u32 | n_ranges u8 | n_ranges x (first u32, last u32), descending |
@@ -24,6 +29,8 @@ DATA = 1
 ACK = 2
 ACK_BLOCK = 3
 TRAIN = 4
+PING = 5
+PONG = 6
 
 FLOW_UP = 0  # browser -> server
 FLOW_DOWN = 1  # server -> browser
@@ -35,6 +42,7 @@ _RANGE = struct.Struct("!II")
 _U16 = struct.Struct("!H")
 _TS = struct.Struct("!If")
 _TRAIN = struct.Struct("!BBHHHd")
+_ECHO = struct.Struct("!BBIdd")
 
 MAX_ACK_RANGES = 16
 MAX_DATAGRAM_PAYLOAD = 1000  # fits Chrome's 1024-byte maxDatagramSize with the WebTransport prefix
@@ -42,6 +50,7 @@ MAX_DATAGRAM_PAYLOAD = 1000  # fits Chrome's 1024-byte maxDatagramSize with the 
 DATA_HEADER_SIZE = _DATA.size
 TRAIN_HEADER_SIZE = _TRAIN.size
 ACK_SIZE = _ACK.size
+ECHO_HEADER_SIZE = _ECHO.size
 
 
 class Data(NamedTuple):
@@ -63,6 +72,33 @@ class Train(NamedTuple):
 def encode_train(flow: int, train_id: int, index: int, train_len: int, send_ts: float, size: int) -> bytes:
     header = _TRAIN.pack(TRAIN, flow, train_id & 0xFFFF, index, train_len, send_ts)
     return header + bytes(max(0, size - TRAIN_HEADER_SIZE))
+
+
+class Ping(NamedTuple):
+    flow: int
+    seq: int
+    send_ts: float  # initiator's clock, when it handed the packet to the transport
+    size: int
+
+
+class Pong(NamedTuple):
+    flow: int
+    seq: int
+    send_ts: float  # echoed unchanged, so RTT needs no state at the initiator
+    echo_recv_ts: float  # responder's clock, when the PING arrived
+    size: int
+
+
+def encode_ping(flow: int, seq: int, send_ts: float, size: int = ECHO_HEADER_SIZE) -> bytes:
+    header = _ECHO.pack(PING, flow, seq & 0xFFFFFFFF, send_ts, 0.0)
+    return header + bytes(max(0, size - ECHO_HEADER_SIZE))
+
+
+def encode_pong(
+    flow: int, seq: int, send_ts: float, echo_recv_ts: float, size: int = ECHO_HEADER_SIZE
+) -> bytes:
+    header = _ECHO.pack(PONG, flow, seq & 0xFFFFFFFF, send_ts, echo_recv_ts)
+    return header + bytes(max(0, size - ECHO_HEADER_SIZE))
 
 
 class Ack(NamedTuple):
@@ -122,6 +158,11 @@ def decode(buf: bytes) -> Optional[Union[Data, Train, Ack, AckBlock]]:
     if buf[0] == TRAIN and len(buf) >= TRAIN_HEADER_SIZE:
         _, flow, train_id, index, train_len, ts = _TRAIN.unpack_from(buf)
         return Train(flow, train_id, index, train_len, ts, len(buf))
+    if buf[0] in (PING, PONG) and len(buf) >= ECHO_HEADER_SIZE:
+        kind, flow, seq, send_ts, echo_ts = _ECHO.unpack_from(buf)
+        if kind == PING:
+            return Ping(flow, seq, send_ts, len(buf))
+        return Pong(flow, seq, send_ts, echo_ts, len(buf))
     if buf[0] == ACK and len(buf) >= ACK_SIZE:
         _, flow, seq, echo, recv = _ACK.unpack_from(buf)
         return Ack(flow, seq, echo, recv)

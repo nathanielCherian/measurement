@@ -30,10 +30,17 @@ Two shapes:
   several segments into one; and a cold connection is in slow start, so early
   trains measure congestion-window growth rather than the path.
 
+It also carries the **load generator** the RTT page uses: a bulk transfer in
+either direction against this same host, so you can watch what a saturating TCP
+flow does to the one-way delay of the datagram stream running beside it
+(bufferbloat: the queue it fills is the same queue the probes traverse).
+
 Endpoints (CORS open):
   POST /trains/post?c=<client>&t=<train>&i=<index>&n=<len>&ts=<send_ms>  body = padding
   POST /trains/bulk?c=<client>&t=<train>&n=<len>&size=<bytes>&ts=<send_ms>  body = bulk
   GET  /trains/report?c=<client>[&save=1]  -> summary JSON, optionally written to logs/
+  POST /trains/load/upload            body = anything; read and discarded -> {bytes, ms, mbps}
+  GET  /trains/load/download?bytes=N  -> N bytes of padding, streamed as fast as TCP allows
 """
 
 import argparse
@@ -57,6 +64,11 @@ _WALL_OFFSET = time.time() - time.monotonic()
 # segments, and on loopback the whole body is usually there at once, so bulk
 # dispersion only means something over a real path.
 READ_CHUNK = 4096
+
+# Load generator: big enough chunks that the kernel, not this loop, is the limit.
+LOAD_CHUNK = 64 * 1024
+MAX_LOAD_BYTES = 2 * 1024 * 1024 * 1024
+_LOAD_PAD = bytes(LOAD_CHUNK)
 
 CORS = (
     "Access-Control-Allow-Origin: *\r\n"
@@ -114,6 +126,51 @@ def summarize_bulk(trains: list) -> Optional[dict]:
     }
 
 
+async def handle_load(method: str, path: str, q: dict, body_len: int, reader, writer) -> None:
+    """Saturating transfer in one direction, to load the path under test.
+
+    Upload: swallow the body as fast as it arrives. Download: stream padding
+    until the client has what it asked for or goes away (the page aborts the
+    fetch when you stop the load, which shows up here as a reset).
+    """
+    if method == "OPTIONS":
+        writer.write(f"HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\n\r\n".encode())
+        return
+
+    if path.endswith("/upload"):
+        start = now_ms()
+        got, remaining = 0, body_len
+        while remaining > 0:
+            data = await reader.read(min(remaining, LOAD_CHUNK))
+            if not data:
+                break
+            got += len(data)
+            remaining -= len(data)
+        ms = now_ms() - start
+        payload = json.dumps({"bytes": got, "ms": ms, "mbps": (got * 8 / ms / 1000) if ms else None}).encode()
+        writer.write(
+            f"HTTP/1.1 200 OK\r\n{CORS}Content-Type: application/json\r\n"
+            f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+        )
+        return
+
+    if path.endswith("/download"):
+        total = max(0, min(int(q.get("bytes", 32 * 1024 * 1024)), MAX_LOAD_BYTES))
+        writer.write(
+            f"HTTP/1.1 200 OK\r\n{CORS}Content-Type: application/octet-stream\r\n"
+            f"Cache-Control: no-store\r\nContent-Length: {total}\r\n\r\n".encode()
+        )
+        sent = 0
+        while sent < total:
+            n = min(LOAD_CHUNK, total - sent)
+            writer.write(_LOAD_PAD[:n])
+            await writer.drain()  # backpressure: don't buffer the whole file here
+            sent += n
+        return
+
+    writer.write(f"HTTP/1.1 404 Not Found\r\n{CORS}Content-Length: 0\r\n\r\n".encode())
+
+
 async def handle(reader, writer, log_dir: str) -> None:
     peer = writer.get_extra_info("peername")
     try:
@@ -136,6 +193,10 @@ async def handle(reader, writer, log_dir: str) -> None:
             url = urlparse(target)
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
             body_len = int(headers.get("content-length", 0))
+            if url.path.startswith("/trains/load/"):
+                await handle_load(method, url.path, q, body_len, reader, writer)
+                await writer.drain()
+                continue
             if url.path == "/trains/bulk" and body_len:
                 # Timestamp the body as it lands: each read is roughly one
                 # delivery of segments from the kernel.

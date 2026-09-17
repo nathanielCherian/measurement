@@ -2,13 +2,15 @@
 
 Control: newline-delimited JSON on the client-opened bidirectional stream.
   client -> server  {"type":"start", "mode":"up|down|both", "duration_s", "size",
-                     "down_cc": {"name", "params"}, ...}
+                     "down_cc": {"name", "params"},
+                     "trains": {...}, "rtt": {"direction", "interval_ms", "size", "duration_s"}}
   server -> client  {"type":"started", "server_time_ms", "quic_cc", ...}
   client -> server  {"type":"finish"}             after the run + a grace period
   server -> client  {"type":"server_report", "down": {...}, "up": {...}}
   client -> server  {"type":"results", ...}       browser-side data, saved to the log
   server -> client  {"type":"saved", "file"}
-Probe traffic: DATA/ACK datagrams (protocol.py).
+Probe traffic: DATA/ACK datagrams, TRAIN bursts (trains.py) and PING/PONG for the
+steady-stream RTT monitor (rtt.py), all in protocol.py.
 """
 
 import asyncio
@@ -21,6 +23,7 @@ from typing import Any, Callable, Dict, Optional
 import protocol as proto
 from appcc import make_cc
 from ack import AckGenerator
+from rtt import RttMonitor, RttStreamReceiver, run_rtt_stream
 from trains import TrainReceiver, send_trains
 from transport_stats import ReceiverStats, SenderCore
 from up_analysis import analyze_up
@@ -79,6 +82,11 @@ class Session:
         self.up_acks: Optional[AckGenerator] = None
         self.up_trains = TrainReceiver()
         self._trains_task: Optional[asyncio.Task] = None
+        # RTT monitor: the browser's stream is parsed here (up_rtt) and echoed
+        # back; a server-initiated stream is tracked by down_rtt.
+        self.up_rtt = RttStreamReceiver()
+        self.down_rtt = RttMonitor()
+        self._rtt_task: Optional[asyncio.Task] = None
         self.up_quic_samples: list = []
         self._up_task: Optional[asyncio.Task] = None
         self.start_ms: Optional[float] = None
@@ -130,6 +138,9 @@ class Session:
             trains_cfg = msg.get("trains")
             if trains_cfg and trains_cfg.get("direction") in ("down", "both"):
                 self._trains_task = asyncio.ensure_future(self._run_trains(trains_cfg))
+            rtt_cfg = msg.get("rtt")
+            if rtt_cfg and rtt_cfg.get("direction") in ("down", "both"):
+                self._rtt_task = asyncio.ensure_future(self._run_rtt(rtt_cfg))
             if msg.get("mode") in ("down", "both"):
                 self._task = asyncio.ensure_future(self._run_down())
             if msg.get("mode") in ("up", "both"):
@@ -160,6 +171,14 @@ class Session:
                 self.up_acks.on_packet(pkt.seq, pkt.send_ts, t)
         elif isinstance(pkt, proto.Train) and pkt.flow == proto.FLOW_UP:
             self.up_trains.on_packet(pkt, t)
+        elif isinstance(pkt, proto.Ping) and pkt.flow == proto.FLOW_UP:
+            # Turn it around first (any delay here inflates the browser's RTT),
+            # then parse what its timestamp says about the upstream path.
+            self.h3.send_datagram(self.id, proto.encode_pong(pkt.flow, pkt.seq, pkt.send_ts, t))
+            self.transmit()
+            self.up_rtt.on_ping(pkt, t)
+        elif isinstance(pkt, proto.Pong) and pkt.flow == proto.FLOW_DOWN:
+            self.down_rtt.on_pong(pkt, t)
         elif isinstance(pkt, proto.Ack) and pkt.flow == proto.FLOW_DOWN and self.down:
             self.down.on_ack(t, pkt.seq, pkt.echo_send_ts, pkt.recv_ts)
         elif isinstance(pkt, proto.AckBlock) and pkt.flow == proto.FLOW_DOWN and self.down:
@@ -263,12 +282,31 @@ class Session:
         )
         self.send_control({"type": "trains_done", **result})
 
+    async def _run_rtt(self, cfg: Dict[str, Any]) -> None:
+        """Steady PING stream browser-ward; the page echoes each one back."""
+        result = await run_rtt_stream(
+            lambda buf: (self.h3.send_datagram(self.id, buf), self.transmit()),
+            proto.FLOW_DOWN,
+            now_ms,
+            self.down_rtt,
+            interval_ms=float(cfg.get("interval_ms", 50)),
+            duration_s=float(cfg.get("duration_s", 30)),
+            size=min(int(cfg.get("size", proto.ECHO_HEADER_SIZE)), MAX_SIZE),
+            is_open=lambda: not self.closed,
+        )
+        await asyncio.sleep(min(MAX_GRACE_S, max(0.5, 3 * (self.down_rtt.srtt or 100) / 1000)))
+        self.send_control({"type": "rtt_done", **result})
+
     # ---- reporting ------------------------------------------------------
 
     def report(self, brief: bool) -> Dict[str, Any]:
         out: Dict[str, Any] = {"up": self.up.summary() if self.up.received else None}
         if self.up_trains.packets:
             out["up_trains"] = self.up_trains.summary()
+        if self.up_rtt.received:
+            out["up_rtt"] = self.up_rtt.summary(keep_records=not brief)
+        if self.down_rtt.sent:
+            out["down_rtt"] = self.down_rtt.summary(keep_records=not brief)
         if out["up"] is not None and self.up_acks:
             out["up"]["acks_sent"] = self.up_acks.acks_sent
             out["up"]["ack_mode"] = self.up_acks.mode
@@ -318,7 +356,9 @@ class Session:
         self.closed = True
         if self._trains_task:
             self._trains_task.cancel()
-        if not self.saved and not self.config.get("reference") and (self.up.received or self.down):
+        if self._rtt_task:
+            self._rtt_task.cancel()
+        if not self.saved and not self.config.get("reference") and (self.up.received or self.down or self.up_rtt.received):
             # The peer vanished mid-run (common on mobile): keep what we have.
             try:
                 self._save(None)
