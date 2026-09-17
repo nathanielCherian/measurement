@@ -10,6 +10,12 @@ import * as proto from './protocol.js';
 import { normalizeQuicStats, ReceiverStats, SenderCore, summarizeQuicStats } from './stats.js';
 
 const SAMPLE_MS = 100;
+// End-of-run safety nets. Safari never drops queued datagrams (it ignores
+// outgoingMaxAge), so sending above the path's capacity grows its queue without
+// bound: srtt climbs for the whole run and the results upload queues behind it.
+const MAX_GRACE_MS = 3000;       // cap on the "wait for late ACKs" pause
+const CONTROL_TIMEOUT_MS = 20000; // never wait forever for a control message
+const MAX_RECORDS = 20000;       // per direction, to bound the results upload
 const PROGRESS_MS = 250;
 const STATS_POLL_MS = 250;
 
@@ -116,7 +122,7 @@ async function run(cfg) {
   const wantDown = cfg.mode === 'down' || cfg.mode === 'both';
 
   // ---- receive path -------------------------------------------------------
-  const down = new ReceiverStats();
+  const down = new ReceiverStats(true, MAX_RECORDS);
   const downAcks = new AckGenerator(proto.FLOW_DOWN, cfg.ack, sendDatagram, nowMs);
   let upCore = null;
   let closed = false;
@@ -184,9 +190,14 @@ async function run(cfg) {
   // ---- up sender (browser CC) -------------------------------------------------
   const upTimeline = [];
   let blockedTicks = 0;
+  let upStopped = null;
   if (wantUp) {
     const cc = makeCC(cfg.upCC.name, cfg.upCC.params);
-    upCore = new SenderCore(cc);
+    upCore = new SenderCore(cc, true, MAX_RECORDS);
+    // Standing queue above this ends the run early: the sender is far above the
+    // path's capacity and everything after it (ACKs, control messages) is stuck
+    // behind the queue.
+    const queueGuardMs = cfg.queueGuardMs ?? 2000;
     const end = t0 + cfg.durationS * 1000;
     let last = t0;
     let lastSample = t0;
@@ -213,6 +224,16 @@ async function run(cfg) {
         tokens -= size;
       }
 
+      if (
+        upCore.srtt !== null && upCore.minRtt !== null &&
+        upCore.srtt - upCore.minRtt > queueGuardMs
+      ) {
+        upStopped = { reason: 'queue_guard', t: t - t0, srtt: upCore.srtt, minRtt: upCore.minRtt };
+        logLine(`stopping early: standing queue ${(upCore.srtt - upCore.minRtt).toFixed(0)} ms ` +
+          `(srtt ${upCore.srtt.toFixed(0)} ms, min ${upCore.minRtt.toFixed(1)} ms) — sending faster than the path allows`);
+        break;
+      }
+
       if (t - lastSample >= SAMPLE_MS) {
         lastSample = t;
         upTimeline.push({
@@ -222,20 +243,26 @@ async function run(cfg) {
       }
       await sleep(1);
     }
-    await sleep(Math.max(500, 3 * (upCore.srtt ?? 100)));
+    await sleep(Math.min(Math.max(500, 3 * (upCore.srtt ?? 100)), MAX_GRACE_MS));
     upCore.checkTimeouts(nowMs() + 1e9);
   }
 
   let downDone = null;
   if (wantDown) {
-    downDone = await control.waitFor('down_done', cfg.durationS * 1000 + 15000);
+    downDone = await control.waitFor('down_done', cfg.durationS * 1000 + 15000).catch((e) => {
+      logLine(`no down_done: ${e.message}`);
+      return null;
+    });
   }
 
   clearInterval(progressTimer);
   clearInterval(statsTimer);
 
   await control.send({ type: 'finish' });
-  const serverReport = await control.waitFor('server_report');
+  const serverReport = await control.waitFor('server_report', CONTROL_TIMEOUT_MS).catch((e) => {
+    logLine(`no server_report: ${e.message}`);
+    return {};
+  });
 
   const results = {
     config: cfg,
@@ -245,16 +272,27 @@ async function run(cfg) {
     max_datagram_size: dg.maxDatagramSize ?? null,
     congestion_control: transport.congestionControl ?? null,
     write_errors: writeErrors,
+    up_stopped_early: upStopped,
     max_pending_writes: maxPendingWrites,
-    up: upCore && { ...upCore.summary(), blocked_ticks: blockedTicks, timeline: upTimeline, records: upCore.records },
-    down: wantDown ? { ...down.summary(), acks_sent: downAcks.acksSent, ack_mode: downAcks.mode, records: down.records } : null,
+    up: upCore && {
+      ...upCore.summary(), blocked_ticks: blockedTicks, timeline: upTimeline,
+      records: upCore.records, records_truncated: upCore.recordsTruncated,
+    },
+    down: wantDown ? {
+      ...down.summary(), acks_sent: downAcks.acksSent, ack_mode: downAcks.mode,
+      records: down.records, records_truncated: down.recordsTruncated,
+    } : null,
     down_done: downDone,
     webtransport_stats: wtStats,
     browser_quic: summarizeQuicStats(wtStats),
   };
 
+  post({ type: 'results', results, serverReport, savedFile: null, pending: true });
   await control.send({ type: 'results', ...results });
-  const saved = await control.waitFor('saved', 30000).catch(() => null);
+  const saved = await control.waitFor('saved', CONTROL_TIMEOUT_MS).catch((e) => {
+    logLine(`results not confirmed saved: ${e.message}`);
+    return null;
+  });
   closed = true;
   downAcks.close();
   transport.close();

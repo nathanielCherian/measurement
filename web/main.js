@@ -207,6 +207,7 @@ form.addEventListener('submit', async (e) => {
     browserCongestionControl: f.browserCongestionControl.value,
     upCC: { name: f.upCCName.value, params: JSON.parse(f.upCCParams.value || '{}') },
     downCC: { name: f.downCCName.value, params: JSON.parse(f.downCCParams.value || '{}') },
+    queueGuardMs: Number(f.queueGuardMs.value) || Infinity,
     ack: { mode: f.ackMode.value, interval_ms: Number(f.ackIntervalMs.value), every_n: Number(f.ackEveryN.value) },
     outgoingMaxAgeMs: Number(f.outgoingMaxAgeMs.value) || null,
     outgoingHighWaterMark: Number(f.outgoingHighWaterMark.value) || null,
@@ -249,6 +250,11 @@ form.addEventListener('submit', async (e) => {
       drawLive();
     } else if (m.type === 'results') {
       const { results: r, serverReport: s } = m;
+      if (r.up_stopped_early) {
+        log(`run stopped early (${r.up_stopped_early.reason}): standing queue ` +
+          `${(r.up_stopped_early.srtt - r.up_stopped_early.minRtt).toFixed(0)} ms at ` +
+          `${(r.up_stopped_early.t / 1000).toFixed(1)} s`);
+      }
       lastResults = { browser: r, server: s };
       renderStats([
         ...(r.up ? [
@@ -266,15 +272,21 @@ form.addEventListener('submit', async (e) => {
           ['server blocked by QUIC', `${s.down?.blocked_ticks ?? 0} ticks`],
         ] : []),
         ['ACK mode', r.config.ack?.mode ?? 'packet'],
+        ...(r.up_stopped_early ? [['stopped early', r.up_stopped_early.reason]] : []),
         ...(r.up ? [['up ACKs received (browser)', fmt.n(r.up.acks_received)]] : []),
         ...(r.down ? [['down ACKs sent (browser)', fmt.n(r.down.acks_sent)]] : []),
         ['max datagram size', fmt.n(r.max_datagram_size)],
       ]);
       drawFinal(r, s);
       renderQuicFinal(r, s);
+      $('download').disabled = false;
+      if (m.pending) {
+        // Results are rendered now; the upload to the server is still in flight.
+        $('status').textContent = 'uploading results…';
+        return;
+      }
       log(`done${m.savedFile ? `; server saved ${m.savedFile}` : ''}`);
       $('status').textContent = 'done';
-      $('download').disabled = false;
       done();
     }
   };

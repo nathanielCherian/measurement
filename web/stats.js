@@ -5,7 +5,7 @@ export const REORDER_THRESHOLD = 3;
 export const BIN_MS = 100;
 
 export class SenderCore {
-  constructor(cc, keepRecords = true) {
+  constructor(cc, keepRecords = true, maxRecords = Infinity) {
     this.cc = cc;
     this.nextSeq = 0;
     this.unacked = new Map(); // seq -> [sendTs, size], insertion (= seq) order
@@ -17,6 +17,14 @@ export class SenderCore {
     this.bytesSent = 0;
     this.rtts = [];
     this.records = keepRecords ? [] : null;
+    this.maxRecords = maxRecords;
+    this.recordsTruncated = 0;
+  }
+
+  addRecord(row) {
+    if (this.records === null) return;
+    if (this.records.length < this.maxRecords) this.records.push(row);
+    else this.recordsTruncated++;
   }
 
   onSend(now, size) {
@@ -46,7 +54,7 @@ export class SenderCore {
       this.srtt = 0.875 * this.srtt + 0.125 * rtt;
     }
     this.minRtt = this.minRtt === null ? rtt : Math.min(this.minRtt, rtt);
-    this.records?.push([seq, echoSendTs, recvTs, now]);
+    this.addRecord([seq, echoSendTs, recvTs, now]);
 
     this.cc.onAck(now, seq, size, rtt, this.srtt, this.minRtt);
 
@@ -88,7 +96,7 @@ export class SenderCore {
       this.unacked.delete(s);
       this.inflightBytes -= size;
       this.acked++;
-      this.records?.push([s, sendTs, recvTs.get(s) ?? null, now]);
+      this.addRecord([s, sendTs, recvTs.get(s) ?? null, now]);
       if (this.srtt !== null) this.cc.onAck(now, s, size, rtt ?? this.srtt, this.srtt, this.minRtt);
     }
 
@@ -136,7 +144,7 @@ export class SenderCore {
 }
 
 export class ReceiverStats {
-  constructor(keepRecords = true) {
+  constructor(keepRecords = true, maxRecords = Infinity) {
     this.received = 0; this.bytes = 0; this.maxSeq = -1;
     this.reordered = 0; this.duplicates = 0;
     this.seen = new Set();
@@ -144,6 +152,8 @@ export class ReceiverStats {
     this.firstRecv = null;
     this.bins = new Map();
     this.records = keepRecords ? [] : null;
+    this.maxRecords = maxRecords;
+    this.recordsTruncated = 0;
   }
 
   onData(seq, sendTs, recvTs, size) {
@@ -162,7 +172,10 @@ export class ReceiverStats {
     if (this.firstRecv === null) this.firstRecv = recvTs;
     const b = Math.floor((recvTs - this.firstRecv) / BIN_MS);
     this.bins.set(b, (this.bins.get(b) ?? 0) + size);
-    this.records?.push([seq, sendTs, recvTs, size]);
+    if (this.records !== null) {
+      if (this.records.length < this.maxRecords) this.records.push([seq, sendTs, recvTs, size]);
+      else this.recordsTruncated++;
+    }
   }
 
   summary() {

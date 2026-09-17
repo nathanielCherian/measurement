@@ -28,6 +28,7 @@ log = logging.getLogger("session")
 
 _WALL_OFFSET = time.time() - time.monotonic()
 
+MAX_GRACE_S = 3.0  # cap on the end-of-run wait for late ACKs
 SAMPLE_MS = 100
 QUIC_SAMPLE_MS = 20
 MAX_PENDING_DATAGRAMS = 64  # beyond this, aioquic's own cwnd/pacer is the bottleneck
@@ -66,6 +67,7 @@ class Session:
         self.shaper_stats = shaper_stats
         self.created = now_ms()
 
+        self.saved = False
         self.control_stream: Optional[int] = None
         self._buf = b""
         self.config: Dict[str, Any] = {}
@@ -135,6 +137,7 @@ class Session:
             self.send_control({"type": "server_report", **self.report(brief=True)})
         elif kind == "results":
             path = self._save(msg)
+            self.saved = True
             self.send_control({"type": "saved", "file": os.path.relpath(path)})
         else:
             log.warning("unknown control message %r", kind)
@@ -205,7 +208,7 @@ class Session:
             await asyncio.sleep(0.001)
 
         # let trailing ACKs arrive, then sweep remaining packets as lost
-        await asyncio.sleep(max(0.5, 3 * (core.srtt or 100) / 1000))
+        await asyncio.sleep(min(max(0.5, 3 * (core.srtt or 100) / 1000), MAX_GRACE_S))
         core.check_timeouts(now_ms() + 1e9)
         self.send_control({"type": "down_done", **core.summary()})
 
@@ -287,6 +290,12 @@ class Session:
         if self.closed:
             return
         self.closed = True
+        if not self.saved and (self.up.received or self.down):
+            # The peer vanished mid-run (common on mobile): keep what we have.
+            try:
+                self._save(None)
+            except Exception:  # noqa: BLE001 - never fail teardown
+                log.exception("session %d: could not save partial results", self.id)
         if self._task:
             self._task.cancel()
         if self._up_task:

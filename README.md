@@ -99,6 +99,22 @@ The receiver acknowledges probe packets in one of two modes, chosen on the page 
 Implementations: `server/ack.py` + `SenderCore.on_ack_block`, and `web/ack.js` +
 `SenderCore.onAckBlock`. Both produce byte-identical ACKs.
 
+## Sending above the path's capacity (mobile Safari)
+
+Safari does not drop queued datagrams (it ignores `outgoingMaxAge`), so a fixed rate above the
+path's capacity grows its queue without bound: app RTT climbs for the whole run and everything
+after it — ACKs, control messages, the results upload — queues behind it. On a phone uplink that
+looks like "the run never ends and srtt keeps rising".
+
+Safety nets in `web/worker.js`:
+- **Queue guard** (page field, default 2000 ms): stop sending when `srtt − minRtt` exceeds it, and
+  report `up_stopped_early: {reason: "queue_guard", …}`. Set 0 to disable.
+- **Capped waits:** the end-of-run pause for late ACKs is at most 3 s, and every control message
+  wait times out (20 s) instead of hanging; results are shown even when the server never replies.
+- **Capped records:** at most 20,000 per-packet records per direction (`records_truncated` counts
+  the rest), to bound the size of the results upload.
+- The server saves a partial log if the peer disappears mid-run, and caps its own end-of-run wait.
+
 ## Is the browser's QUIC congestion control limiting the upload?
 
 Each run's results include:

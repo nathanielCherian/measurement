@@ -178,6 +178,12 @@ upstream with `outgoingMaxAge = 100`:
   (IAT p50 0.82 ms), and bursts sent in one timer tick arrive re-spaced.
 - **Very slow runs.** With multi-second RTTs the worker's end-of-run grace period (3 × srtt) makes
   runs take much longer than the configured duration. Don't close the tab early.
+- **Same on iOS.** Reported on iPhone Safari against a real uplink: the run never finished and srtt
+  grew for the whole run — the unbounded queue again, since a fixed rate above the uplink's capacity
+  is never trimmed by the browser. The worker now stops when the standing queue passes the queue
+  guard (default 2 s), caps the grace period at 3 s, and times out every control wait; the page
+  reports `up_stopped_early`. Verified on macOS Safari behind a 10 Mbps emulated uplink at 20 Mbps:
+  the guard fired at 4.1 s (srtt 2,011 ms vs min RTT 7.9 ms) and the run saved 10 s after start.
 
 ## Debugging workflow that worked
 
