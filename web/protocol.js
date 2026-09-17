@@ -9,12 +9,24 @@
 export const DATA = 1;
 export const ACK = 2;
 export const ACK_BLOCK = 3;
+export const TRAIN = 4;
+export const TRAIN_HEADER_SIZE = 16;
 export const MAX_ACK_RANGES = 16;
 export const MAX_DATAGRAM_PAYLOAD = 1000;
 const BLOCK_HEAD_SIZE = 27;
 
 export function blockTsCapacity(nRanges) {
   return Math.floor((MAX_DATAGRAM_PAYLOAD - BLOCK_HEAD_SIZE - nRanges * 8 - 2) / 8);
+}
+
+// TRAIN: type u8 | flow u8 | train_id u16 | index u16 | train_len u16 | send_ts f64 | padding
+export function encodeTrain(flow, trainId, index, trainLen, sendTs, size) {
+  const buf = new Uint8Array(Math.max(size, TRAIN_HEADER_SIZE));
+  const v = new DataView(buf.buffer);
+  v.setUint8(0, TRAIN); v.setUint8(1, flow);
+  v.setUint16(2, trainId & 0xffff); v.setUint16(4, index); v.setUint16(6, trainLen);
+  v.setFloat64(8, sendTs);
+  return buf;
 }
 
 export function encodeAckBlock(flow, ackId, largest, largestRecvTs, ackDelayMs, low, ranges, timestamps) {
@@ -61,6 +73,12 @@ export function decode(bytes) {
   }
   if (bytes.byteLength >= ACK_SIZE && bytes[0] === ACK) {
     return { type: ACK, flow: v.getUint8(1), seq: v.getUint32(2), echoSendTs: v.getFloat64(6), recvTs: v.getFloat64(14) };
+  }
+  if (bytes.byteLength >= TRAIN_HEADER_SIZE && bytes[0] === TRAIN) {
+    return {
+      type: TRAIN, flow: v.getUint8(1), trainId: v.getUint16(2), index: v.getUint16(4),
+      trainLen: v.getUint16(6), sendTs: v.getFloat64(8), size: bytes.byteLength,
+    };
   }
   if (bytes.byteLength >= BLOCK_HEAD_SIZE && bytes[0] === ACK_BLOCK) {
     const largestRecvTs = v.getFloat64(10);

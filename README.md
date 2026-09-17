@@ -144,6 +144,31 @@ Safety nets in `web/worker.js`:
   the rest), to bound the size of the results upload.
 - The server saves a partial log if the peer disappears mid-run, and caps its own end-of-run wait.
 
+## Packet trains (`web/trains.html`)
+
+A train is N packets handed to the transport back to back, repeated every `gap_ms`; the receiver
+measures the spacing they arrive with. Because each packet is stamped as the sender hands it over:
+
+- **send-side spread** — how much the sender's own stack spread the burst before the wire
+- **dispersion** — last arrival minus first, at the receiver
+- **implied rate** = (N−1) × size × 8 / dispersion — the classic packet-train capacity estimate
+
+Three transports, selectable on the page:
+
+| Transport | Server | Direction | Notes |
+|---|---|---|---|
+| WebTransport datagrams | `server.py` | up / down / both | UDP; what the other pages use |
+| WebRTC DataChannel | `rtc_server.py` | up / down / both | unordered, `maxRetransmits: 0` |
+| HTTP POST | `http_trains.py --port 8081` | up only | TCP: each packet is a POST, timed when its body lands |
+
+Validated against the emulated 10 Mbps uplink (`--emulate-up-mbps 10`), Chrome, 16 × 1000 B trains:
+dispersion **12.4 ms** (theory 12.0), IAT **0.83 ms** (0.80), implied rate **9.7 Mbps**. On an
+unshaped loopback the same trains gave ~46–86 Mbps, i.e. the estimate tracks the bottleneck.
+
+Caveats for the POST transport: the browser spread one train across **6 TCP connections** in
+testing (the report counts them), TCP repairs loss below the measurement, and request headers add
+bytes, so the implied rate is a loose lower bound. It also bypasses the UDP emulator entirely.
+
 ## Where is the queue: browser or network?
 
 The page can open a **reference probe**: a second WebTransport connection to the same server

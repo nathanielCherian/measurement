@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Browser CC Probe (WebRTC)</title>
+<title>Packet Trains</title>
 <style>
   :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafafa; --card:#fff; --line:#e3e3e6; --accent:#2563eb; }
   body { font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; padding: 16px; }
@@ -33,38 +33,38 @@
 </head>
 <body>
 <main>
-  <h1>Browser ⇄ server datagram probe (WebRTC DataChannel)</h1>
-  <p class="note">Same probes, controllers and ACKs as the <a href="index.html">WebTransport page</a> · packet trains: <a href="trains.html">trains.html</a>,
-    over an unordered, non-retransmitting data channel. SCTP congestion-controls it, so the browser's
-    stack still sits under your controller. Signaling is one HTTP POST; the media path needs no certificate.</p>
+  <h1>Packet trains (WebTransport or WebRTC DataChannel)</h1>
+  <p class="note">A train is N packets handed to the transport back to back, repeated every gap. The receiver measures
+    the spacing they arrive with. Each packet is stamped as the sender hands it over, so <b>send-side spread</b> shows how
+    much the browser's own pacer (or SCTP) spread the burst before the wire; <b>dispersion</b> at the receiver reflects the
+    bottleneck. The <b>HTTP POST</b> transport sends each packet as a POST over TCP (up only): loss is repaired
+    below you and the browser may spread the burst over several sockets, so it measures something different — the report
+    says how many connections the server saw. Implied rate = (N−1) × size × 8 / dispersion. Other pages:
+    <a href="index.html">WebTransport probe</a>, <a href="rtc.html">WebRTC probe</a>.</p>
 
   <section class="card">
     <form id="form">
-      <label class="wide">Signaling URL <input name="signalUrl" value="http://localhost:8080/offer"></label>
-      <label>STUN server (optional) <input name="stunUrl" placeholder="stun:stun.l.google.com:19302"></label>
-      <label>Mode
-        <select name="mode">
-          <option value="up">up (browser → server, JS CC)</option>
-          <option value="down">down (server → browser, server CC)</option>
+      <label>Transport
+        <select name="transport">
+          <option value="webtransport">WebTransport datagrams</option>
+          <option value="webrtc">WebRTC DataChannel</option>
+          <option value="http-post">HTTP POST (TCP)</option>
+        </select>
+      </label>
+      <label>Direction
+        <select name="direction">
+          <option value="up">up (browser → server)</option>
+          <option value="down">down (server → browser)</option>
           <option value="both">both</option>
         </select>
       </label>
-      <label>Duration (s) <input name="durationS" type="number" value="10" min="1" step="1"></label>
-      <label>Message size (bytes) <input name="size" type="number" value="1000" min="64" max="1100"></label>
-      <label>Up CC (browser) <select name="upCCName"><option>fixed</option><option>aimd</option></select></label>
-      <label>Up CC params (JSON) <textarea name="upCCParams">{"rate_mbps": 2}</textarea></label>
-      <label>Down CC (server) <select name="downCCName"><option>fixed</option><option>aimd</option></select></label>
-      <label>Down CC params (JSON) <textarea name="downCCParams">{"rate_mbps": 2}</textarea></label>
-      <label>ACK mode (both directions)
-        <select name="ackMode">
-          <option value="block">block (ranges + timestamps)</option>
-          <option value="packet">per packet</option>
-        </select>
-      </label>
-      <label>Block ACK interval (ms) <input name="ackIntervalMs" type="number" value="20" min="1"></label>
-      <label>Block ACK every N packets <input name="ackEveryN" type="number" value="16" min="1"></label>
-      <label>Queue guard (ms, 0 = off) <input name="queueGuardMs" type="number" value="2000" min="0"></label>
-      <label>Pause sending above bufferedAmount (bytes) <input name="bufferedLimit" type="number" value="262144" min="1024"></label>
+      <label class="wide">WebTransport URL <input name="url" value="https://127.0.0.1:4433/probe"></label>
+      <label class="wide">WebRTC signaling URL <input name="signalUrl" value="http://localhost:8080/offer"></label>
+      <label class="wide">HTTP POST URL <input name="postUrl" value="http://localhost:8081/trains/post"></label>
+      <label>Packets per train <input name="trainLen" type="number" value="16" min="2" max="500"></label>
+      <label>Number of trains <input name="trains" type="number" value="50" min="1" max="2000"></label>
+      <label>Gap between trains (ms) <input name="gapMs" type="number" value="200" min="10"></label>
+      <label>Packet size (bytes) <input name="size" type="number" value="1000" min="64" max="1100"></label>
       <div class="row wide">
         <button id="run" type="submit">Run</button>
         <button id="download" type="button" class="secondary" disabled>Download JSON</button>
@@ -76,16 +76,16 @@
   <section class="card"><div class="stats" id="stats"></div></section>
 
   <section class="card">
+    <div class="legend" id="dispersionLegend"></div>
+    <canvas id="dispersionChart"></canvas>
     <div class="legend" id="rateLegend"></div>
     <canvas id="rateChart"></canvas>
-    <div class="legend" id="rttLegend"></div>
-    <canvas id="rttChart"></canvas>
-    <div class="legend" id="sctpLegend"></div>
-    <canvas id="sctpChart"></canvas>
+    <div class="legend" id="iatLegend"></div>
+    <canvas id="iatChart"></canvas>
   </section>
 
   <section class="card"><pre id="log"></pre></section>
 </main>
-<script type="module" src="rtc-main.js"></script>
+<script type="module" src="trains-main.js"></script>
 </body>
 </html>

@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import protocol as proto
 from ack import AckGenerator
 from appcc import make_cc
+from trains import TrainReceiver, send_trains
 from transport_stats import ReceiverStats, SenderCore
 from up_analysis import analyze_up
 
@@ -60,6 +61,8 @@ class RtcSession:
         self.down_blocked_ticks = 0
         self.up = ReceiverStats()
         self.up_acks: Optional[AckGenerator] = None
+        self.up_trains = TrainReceiver()
+        self._trains_task: Optional[asyncio.Task] = None
         self.up_sctp_samples: List[Dict[str, Any]] = []
         self._task: Optional[asyncio.Task] = None
         self._up_task: Optional[asyncio.Task] = None
@@ -107,6 +110,9 @@ class RtcSession:
             self.send_control(
                 {"type": "started", "server_time_ms": now_ms(), "transport": "webrtc-datachannel", "size": self.config["size"]}
             )
+            trains_cfg = msg.get("trains")
+            if trains_cfg and trains_cfg.get("direction") in ("down", "both"):
+                self._trains_task = asyncio.ensure_future(self._run_trains(trains_cfg))
             if msg.get("mode") in ("down", "both"):
                 self._task = asyncio.ensure_future(self._run_down())
             if msg.get("mode") in ("up", "both"):
@@ -137,6 +143,8 @@ class RtcSession:
             self.up.on_data(pkt.seq, pkt.send_ts, t, pkt.size)
             if self.up_acks:
                 self.up_acks.on_packet(pkt.seq, pkt.send_ts, t)
+        elif isinstance(pkt, proto.Train) and pkt.flow == proto.FLOW_UP:
+            self.up_trains.on_packet(pkt, t)
         elif isinstance(pkt, proto.Ack) and pkt.flow == proto.FLOW_DOWN and self.down:
             self.down.on_ack(t, pkt.seq, pkt.echo_send_ts, pkt.recv_ts)
         elif isinstance(pkt, proto.AckBlock) and pkt.flow == proto.FLOW_DOWN and self.down:
@@ -224,10 +232,26 @@ class RtcSession:
                 )
             await asyncio.sleep(SCTP_SAMPLE_MS / 1000)
 
+    async def _run_trains(self, cfg: Dict[str, Any]) -> None:
+        """Send packet trains browser-ward; the page measures their spacing."""
+        result = await send_trains(
+            self._send_probe,
+            proto.FLOW_DOWN,
+            now_ms,
+            train_len=int(cfg.get("train_len", 16)),
+            trains=int(cfg.get("trains", 50)),
+            gap_ms=float(cfg.get("gap_ms", 200)),
+            size=min(int(cfg.get("size", 1000)), MAX_SIZE),
+            is_open=lambda: not self.closed,
+        )
+        self.send_control({"type": "trains_done", **result})
+
     # ---- reporting -------------------------------------------------------
 
     def report(self, brief: bool) -> Dict[str, Any]:
         out: Dict[str, Any] = {"up": self.up.summary() if self.up.received else None}
+        if self.up_trains.packets:
+            out["up_trains"] = self.up_trains.summary()
         if out["up"] is not None and self.up_acks:
             out["up"]["acks_sent"] = self.up_acks.acks_sent
             out["up"]["ack_mode"] = self.up_acks.mode
@@ -270,6 +294,8 @@ class RtcSession:
         if self.closed:
             return
         self.closed = True
+        if self._trains_task:
+            self._trains_task.cancel()
         for task in (self._task, self._up_task):
             if task:
                 task.cancel()
