@@ -13,6 +13,7 @@
 import { drawChart } from './chart.js';
 import * as proto from './protocol.js';
 import { RttMonitor, RttStreamReceiver, percentiles, runRttStream } from './rtt.js';
+import { normalizeQuicStats, summarizeQuicStats } from './stats.js';
 import { connectWebRTC, connectWebTransport } from './transport.js';
 
 const $ = (id) => document.getElementById(id);
@@ -23,9 +24,12 @@ const nowMs = () => performance.timeOrigin + performance.now();
 // the path, so keep the local datagram queue shallow and let stale ones expire.
 const RTT_WT_OPTS = { highWaterMark: 4, maxAgeMs: 2000 };
 const LIVE_MS = 500;
+const QUIC_STATS_MS = 250;
 
 let lastResults = null;
 let stopRun = false;
+let queueLabel = 'local queue';
+let serverReport = null;   // arrives only at the end of a run; null while one is live
 
 if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(location.hostname)) {
   const f = form.elements;
@@ -162,6 +166,19 @@ async function run(cfg) {
     ? await connectWebTransport(cfg, onProbe, RTT_WT_OPTS)
     : await connectWebRTC(cfg, onProbe);
   log(`connected: ${conn.label}`);
+  queueLabel = conn.queueLabel ?? 'local queue';
+
+  // Every hand-off is timed: how long the transport took to accept the write
+  // (WebTransport resolves the promise once the datagram is accepted for
+  // sending) and how full its own outgoing queue was at that moment. Those two,
+  // beside the gap we actually achieved, are the browser-side view of spacing.
+  const sendProbe = (bytes, seq) => {
+    const t0 = nowMs();
+    const queued = conn.queue?.() ?? null;
+    const p = conn.sendProbe(bytes);
+    if (p && typeof p.then === 'function') p.then(() => upMonitor.onWriteDone(seq, nowMs() - t0, queued));
+    else upMonitor.onWriteDone(seq, null, queued);
+  };
 
   conn.control.send({
     type: 'start', mode: 'none', duration_s: 0, size: cfg.size,
@@ -171,7 +188,17 @@ async function run(cfg) {
   await conn.control.waitFor('started');
   runStart = nowMs();
   chartXMax = cfg.durationS;
+  serverReport = null;
   load.samples.length = 0; load.events.length = 0; load.bytes = 0;
+
+  // The browser's own view of its QUIC connection, where it exposes one. Its
+  // datagram counters say whether the browser dropped or expired packets in its
+  // send queue - something no amount of app-level timing can see directly.
+  const quicSamples = [];
+  const quicTimer = setInterval(async () => {
+    const raw = await conn.stats?.();
+    if (raw) quicSamples.push(normalizeQuicStats(raw, nowMs(), upMonitor.srtt));
+  }, QUIC_STATS_MS);
 
   const live = setInterval(() => renderLive(upMonitor, downReceiver), LIVE_MS);
   let upResult = null;
@@ -180,7 +207,7 @@ async function run(cfg) {
       const tick = ticker(cfg.intervalMs);
       log(`sending a ${cfg.size} B packet every ${cfg.intervalMs} ms for ${cfg.durationS} s`);
       upResult = await runRttStream({
-        send: conn.sendProbe, flow: proto.FLOW_UP, nowMs, monitor: upMonitor,
+        send: sendProbe, flow: proto.FLOW_UP, nowMs, monitor: upMonitor,
         intervalMs: cfg.intervalMs, durationS: cfg.durationS, size: cfg.size, tick,
         isOpen: () => !stopRun,
       });
@@ -194,10 +221,11 @@ async function run(cfg) {
     await new Promise((r) => setTimeout(r, Math.min(2000, 3 * (upMonitor.srtt ?? 200))));
   } finally {
     clearInterval(live);
+    clearInterval(quicTimer);
   }
 
   conn.control.send({ type: 'finish' });
-  const serverReport = await conn.control.waitFor('server_report').catch(() => ({}));
+  serverReport = await conn.control.waitFor('server_report').catch(() => ({}));
 
   const results = {
     experiment: 'rtt-monitor',
@@ -208,6 +236,8 @@ async function run(cfg) {
     up_monitor: upMonitor.summary(true),        // browser -> server -> browser
     down_receiver: downReceiver.summary(true),  // server -> browser, one way
     load: { events: load.events, samples: load.samples, bytes: load.bytes },
+    queue_label: queueLabel,
+    browser_quic: summarizeQuicStats(quicSamples),
     server: serverReport,
   };
   lastResults = results;
@@ -236,6 +266,15 @@ function renderLive(upMonitor, downReceiver) {
     rows.push(['queue above min p95', fmt.ms(percentiles(upMonitor.rtts.map((r) => r - upMonitor.minRtt))?.p95),
       (upMonitor.srtt ?? 0) - (upMonitor.minRtt ?? 0) > 50]);
   }
+  if (upMonitor.sendGaps.length) {
+    const gaps = percentiles(upMonitor.sendGaps);
+    rows.push(['hand-off gap p50 / p95', `${fmt.ms(gaps?.p50)} / ${fmt.ms(gaps?.p95)}`]);
+    const w = percentiles(upMonitor.writeMs);
+    if (w) rows.push(['write accepted after p95 / max', `${fmt.ms(w.p95)} / ${fmt.ms(w.max)}`, w.p95 > 1]);
+    const q = percentiles(upMonitor.queueDepth);
+    if (q) rows.push([queueLabel, q.min === q.max ? `${q.min} (constant: not reported)`
+      : `p50 ${q.p50.toFixed(0)} / max ${q.max.toFixed(0)}`]);
+  }
   if (downReceiver.received) {
     rows.push(['down packets received', fmt.n(downReceiver.received)]);
     rows.push(['down jitter (RFC 3550)', fmt.ms(downReceiver.jitter)]);
@@ -245,6 +284,7 @@ function renderLive(upMonitor, downReceiver) {
   if (load.controller) rows.push(['load', `${load.direction}, ${(load.bytes / 1e6).toFixed(1)} MB`]);
   $('stats').innerHTML = tiles(rows);
   drawDelayChart(upMonitor, downReceiver);
+  drawSpacingChart(upMonitor, downReceiver, serverReport);
   drawLoadChart();
 }
 
@@ -273,6 +313,37 @@ function drawDelayChart(upMonitor, downReceiver) {
   drawChart($('delayChart'), $('delayLegend'), series, 'ms', chartXMax);
 }
 
+// What happened to the spacing, step by step: the gap we achieved between
+// hand-offs, how long the browser then held each write, and the gap the packets
+// actually arrived with at the far end. Divergence between the first and the
+// last is the browser (or the path) respacing the stream.
+function drawSpacingChart(upMonitor, downReceiver, report) {
+  const t0 = runStart ?? 0;
+  const series = [];
+  const sent = upMonitor.sendRecords ?? [];
+  if (sent.length) {
+    series.push({ name: 'browser: gap between hand-offs', color: '#2563eb',
+      points: sent.map((r) => [(r.t - t0) / 1000, r.gap_ms]) });
+    if (upMonitor.writeMs.length) {
+      series.push({ name: 'browser: write accepted after', color: '#dc2626',
+        points: sent.map((r) => [(r.t - t0) / 1000, r.write_ms]) });
+    }
+  }
+  const dn = downReceiver.records ?? [];
+  if (dn.length) {
+    series.push({ name: 'browser: arrival gap (server → browser)', color: '#7c3aed',
+      points: dn.map((r) => [(r.t - t0) / 1000, r.iat_ms]) });
+  }
+  // The server's view of our stream only arrives with the final report, as
+  // 100 ms bins - enough to see whether it kept the spacing we sent.
+  const serverBins = report?.up_rtt?.timeline;
+  if (serverBins?.length) {
+    series.push({ name: 'server: arrival gap of our stream (100 ms bins)', color: '#16a34a',
+      points: serverBins.map((b) => [b.t / 1000, b.iat_ms]) });
+  }
+  drawChart($('spacingChart'), $('spacingLegend'), series, 'ms', chartXMax);
+}
+
 function drawLoadChart() {
   drawChart($('loadChart'), $('loadLegend'),
     [{ name: 'load generator throughput', color: '#b45309', points: load.samples }], 'Mbps', chartXMax);
@@ -293,10 +364,19 @@ function render(r, upMonitor, downReceiver) {
     rows.push(['down leg above min p95', fmt.ms(up.down_excess_ms?.p95)]);
     rows.push(['reply loss', fmt.pct(up.loss_pct)]);
   }
+  if (up) {
+    rows.push(['hand-off gap p50 / p95', `${fmt.ms(up.send_gap_ms?.p50)} / ${fmt.ms(up.send_gap_ms?.p95)}`]);
+    if (up.write_ms) rows.push(['write accepted after p95 / max',
+      `${fmt.ms(up.write_ms.p95)} / ${fmt.ms(up.write_ms.max)}`, up.write_ms.p95 > 1]);
+    if (up.queue_depth) rows.push([queueLabel, up.queue_depth.min === up.queue_depth.max
+      ? `${up.queue_depth.min} (constant: not reported)`
+      : `p50 ${up.queue_depth.p50.toFixed(0)} / max ${up.queue_depth.max.toFixed(0)}`]);
+  }
   if (serverUp) {
     rows.push(['@server: one-way delay above min p95', fmt.ms(serverUp.owd_excess_ms?.p95)]);
-    rows.push(['@server: arrival spacing p50', fmt.ms(serverUp.iat_ms?.p50)]);
-    rows.push(['@server: send spacing p50', fmt.ms(serverUp.send_iat_ms?.p50)]);
+    rows.push(['@server: arrival spacing p50 / p95', `${fmt.ms(serverUp.iat_ms?.p50)} / ${fmt.ms(serverUp.iat_ms?.p95)}`]);
+    rows.push(['@server: send spacing p50 / p95', `${fmt.ms(serverUp.send_iat_ms?.p50)} / ${fmt.ms(serverUp.send_iat_ms?.p95)}`]);
+    rows.push(['@server: spacing change |Δ| p95', fmt.ms(serverUp.ipdv_abs_ms?.p95)]);
     rows.push(['@server: jitter / loss', `${fmt.ms(serverUp.jitter_ms)} / ${fmt.pct(serverUp.loss_pct)}`]);
   }
   if (r.down_receiver) {
@@ -305,6 +385,18 @@ function render(r, upMonitor, downReceiver) {
     rows.push(['down: jitter / loss', `${fmt.ms(r.down_receiver.jitter_ms)} / ${fmt.pct(r.down_receiver.loss_pct)}`]);
   }
   if (serverDown) rows.push(['server-side RTT p50', fmt.ms(serverDown.rtt_ms?.p50)]);
+  const bq = r.browser_quic;
+  if (bq?.populated) {
+    rows.push(['browser: datagrams expired in its queue', fmt.n(bq.datagramsExpiredOutgoing),
+      (bq.datagramsExpiredOutgoing ?? 0) > 0]);
+    rows.push(['browser: datagrams lost outgoing', fmt.n(bq.datagramsLostOutgoing)]);
+    rows.push(['browser: app srtt − QUIC srtt p95', fmt.ms(bq.appMinusQuicRttMs?.p95),
+      (bq.appMinusQuicRttMs?.p95 ?? 0) > 5]);
+  } else if (bq?.exposed) {
+    rows.push(['browser: getStats()', 'exposed but all zero']);
+  } else {
+    rows.push(['browser: getStats()', 'not available']);
+  }
   if (load.samples.length) {
     rows.push(['load throughput p50', fmt.mbps(percentiles(load.samples.map((s) => s[1]))?.p50)]);
     rows.push(['load bytes', `${(load.bytes / 1e6).toFixed(1)} MB`]);
@@ -325,6 +417,29 @@ function verdict(r) {
   if (queue < 5) parts.push(`<b>No standing queue:</b> RTT stayed within ${queue.toFixed(1)} ms of its minimum.`);
   else parts.push(`<b>RTT rose ${queue.toFixed(1)} ms above its minimum (p95)</b>, and the excess sat mostly on the ` +
     `${upx > dnx ? 'browser → server' : 'server → browser'} leg (${upx.toFixed(1)} ms up vs ${dnx.toFixed(1)} ms down).`);
+  // Three spacings in a row: what we asked for, what we handed over, what
+  // arrived. Each step that widens the spread names a different culprit.
+  const serverUp = r.server?.up_rtt;
+  const asked = r.config?.intervalMs;
+  const handoff = up.send_gap_ms;
+  const arrived = serverUp?.iat_ms;
+  if (handoff) {
+    const spread = (p) => (p ? p.p95 - p.p50 : null);
+    const bits = [`asked for ${asked} ms spacing; hand-offs came out at p50 ${handoff.p50.toFixed(1)} ms ` +
+      `(p95 ${handoff.p95.toFixed(1)} ms, so the page's own timer added ${(spread(handoff) ?? 0).toFixed(1)} ms of spread)`];
+    if (up.write_ms && up.write_ms.p95 > 1) {
+      bits.push(`<b>the browser held writes</b>: accepting a datagram took up to ${up.write_ms.max.toFixed(1)} ms ` +
+        `(p95 ${up.write_ms.p95.toFixed(1)} ms), which is its own send queue, not the network`);
+    } else if (up.write_ms) {
+      bits.push(`writes were accepted immediately (p95 ${up.write_ms.p95.toFixed(2)} ms), so nothing queued locally`);
+    }
+    if (arrived) {
+      bits.push(`at the server the same packets arrived p50 ${arrived.p50.toFixed(1)} ms apart ` +
+        `(p95 ${arrived.p95.toFixed(1)} ms): the spread grew by ${((spread(arrived) ?? 0) - (spread(handoff) ?? 0)).toFixed(1)} ms ` +
+        `between hand-off and arrival`);
+    }
+    parts.push(bits.join('; ') + '.');
+  }
   if (r.load?.events?.length) {
     parts.push(`Load generator: ${r.load.events.map((e) => `${e.event} @ ${e.t_s.toFixed(1)} s`).join(', ')}. ` +
       `Compare the delay chart before and after those marks - delay that only appears while the transfer runs is ` +

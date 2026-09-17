@@ -95,6 +95,13 @@
     <h2>Delay over time</h2>
     <div class="legend" id="delayLegend"></div>
     <canvas id="delayChart"></canvas>
+    <h2>Packet spacing</h2>
+    <p class="note">The stream's spacing at each step: the gap between hand-offs (the page's own timer), how long the
+      browser then took to accept each write, and the gap the packets actually arrived with. Where the lines diverge is
+      where the respacing happened — writes taking milliseconds to be accepted, or arrival gaps spreading while hand-offs
+      stayed even, is the browser's own queue rather than the path.</p>
+    <div class="legend" id="spacingLegend"></div>
+    <canvas id="spacingChart"></canvas>
     <h2>Load generator</h2>
     <div class="legend" id="loadLegend"></div>
     <canvas id="loadChart"></canvas>

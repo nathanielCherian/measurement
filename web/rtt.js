@@ -55,12 +55,36 @@ export class RttMonitor {
     this.records = keepRecords ? [] : null;
     this.rtts = []; this.ups = []; this.downs = []; this.ipdv = [];
     this.prevRtt = null; this.firstSend = null;
+    // Send side, to catch what the browser does to the stream *after* we hand
+    // it over: the gap we actually achieved between hand-offs, how long the
+    // transport took to accept each write, and how deep its own queue got.
+    this.sendRecords = [];
+    this.sendBySeq = new Map();
+    this.sendGaps = []; this.writeMs = []; this.queueDepth = [];
+    this.prevSend = null;
   }
 
   onSend(seq, t) {
     this.sent++;
     this.pending.set(seq, t);
     if (this.firstSend == null) this.firstSend = t;
+    const gap = this.prevSend == null ? null : t - this.prevSend;
+    this.prevSend = t;
+    if (gap != null) this.sendGaps.push(gap);
+    const rec = { seq, t, gap_ms: gap, write_ms: null, queue: null };
+    this.sendRecords.push(rec);
+    this.sendBySeq.set(seq, rec);
+    return rec;
+  }
+
+  // `writeMs` is the delay before the transport accepted the write (null where
+  // the API is synchronous, as on a data channel); `queue` is its own backlog
+  // at hand-off - writer.desiredSize for WebTransport, bufferedAmount for RTC.
+  onWriteDone(seq, writeMs, queue = null) {
+    const rec = this.sendBySeq.get(seq);
+    if (!rec) return;
+    if (writeMs != null) { rec.write_ms = writeMs; this.writeMs.push(writeMs); }
+    if (queue != null) { rec.queue = queue; this.queueDepth.push(queue); }
   }
 
   onPong(pkt, t) {
@@ -115,9 +139,13 @@ export class RttMonitor {
       ipdv_abs_ms: percentiles(this.ipdv.map(Math.abs)),
       up_excess_ms: this.minUp == null ? null : percentiles(this.ups.map((u) => u - this.minUp)),
       down_excess_ms: this.minDown == null ? null : percentiles(this.downs.map((d) => d - this.minDown)),
+      // send side: what we asked the browser for vs what it did with it
+      send_gap_ms: percentiles(this.sendGaps),
+      write_ms: percentiles(this.writeMs),
+      queue_depth: percentiles(this.queueDepth),
       timeline: binTimeline(this.records ?? [], this.firstSend ?? 0, ['rtt_ms', 'queue_ms', 'srtt_ms']),
     };
-    if (keepRecords) out.records = this.records;
+    if (keepRecords) { out.records = this.records; out.send_records = this.sendRecords; }
     return out;
   }
 }
@@ -198,19 +226,15 @@ export class RttStreamReceiver {
 export async function runRttStream({ send, flow, nowMs, monitor, intervalMs, durationS, size, tick, isOpen, onSample }) {
   const start = nowMs();
   const end = start + durationS * 1000;
-  const gaps = [];
   let n = 0;
-  let prev = null;
   while (isOpen()) {
     const t = nowMs();
     if (t >= end) break;
-    if (prev != null) gaps.push(t - prev);
-    prev = t;
-    monitor.onSend(n, t);
-    send(proto.encodePing(flow, n, t, size));
+    monitor.onSend(n, t);          // records the gap we actually achieved
+    send(proto.encodePing(flow, n, t, size), n);
     n++;
     onSample?.(n, t - start);
     await tick.next();
   }
-  return { sent: n, interval_ms: intervalMs, size, send_gap_ms: percentiles(gaps) };
+  return { sent: n, interval_ms: intervalMs, size, send_gap_ms: percentiles(monitor.sendGaps) };
 }

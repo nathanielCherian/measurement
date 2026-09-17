@@ -273,13 +273,20 @@ async def run_rtt_stream(
     """
     start = now_ms()
     end = start + duration_s * 1000
+    gaps: List[float] = []
     n = 0
+    prev = None
     while is_open():
         t = now_ms()
         if t >= end:
             break
+        if prev is not None:
+            gaps.append(t - prev)
+        prev = t
         monitor.on_send(n, t)
         send(proto.encode_ping(flow, n, t, size))
         n += 1
         await asyncio.sleep(max(0.0, (start + n * interval_ms - now_ms()) / 1000))
-    return {"sent": n, "interval_ms": interval_ms, "size": size}
+    # The gaps we achieved, not the ones we asked for: the peer's arrival
+    # spacing only means something next to this.
+    return {"sent": n, "interval_ms": interval_ms, "size": size, "send_gap_ms": _percentiles(gaps)}

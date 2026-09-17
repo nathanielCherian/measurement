@@ -209,6 +209,33 @@ page, `PING`/`PONG` in `protocol.py`/`protocol.js`. Runs over WebTransport datag
 DataChannel; the server side is wired into both `session.py` and `rtc_session.py` via
 `{"rtt": {"direction", "interval_ms", "size", "duration_s"}}` in the `start` message.
 
+### Packet spacing: what the browser does after hand-off
+
+The page tracks the stream's spacing at every step, per packet, so respacing inside the browser can
+be told from respacing on the path:
+
+| Signal | Where | What it catches |
+|---|---|---|
+| `send_gap_ms` | gap between consecutive hand-offs | the page's own timer jitter (worker tick + main-thread jank) |
+| `write_ms` | `writer.write()` promise resolve time | the browser **holding** a datagram — its pacer or congestion window refusing it |
+| `queue_depth` | `writer.desiredSize` / `bufferedAmount` | backlog in the transport's own outgoing queue |
+| `send_iat_ms` | at the receiver, from the stamps | the spacing the sender *claims* it produced |
+| `iat_ms` | at the receiver, from arrival times | the spacing that actually survived the path |
+
+Read them in order. Ragged `iat` with ragged `send_gap` is a local timer problem, not the network.
+Ragged `iat` with even `send_gap` and small `write_ms` is the path. Large `write_ms` is the browser
+itself, which is the case that invalidates a browser→server congestion-control experiment.
+
+Chrome caveat: `writer.desiredSize` reads a constant `1` regardless of `outgoingHighWaterMark`, so
+it carries no information — the page detects a constant value and labels it *not reported* rather
+than showing a misleading number. Chrome also has no WebTransport `getStats()`, so its datagram
+counters are unavailable; Safari exposes the fields but leaves them zero (`web/stats.js` marks
+samples `populated` only when the counters move). `write_ms` is the signal that works today.
+
+Measured locally (Chrome, 20 ms interval, loopback, upload load running): hand-off gap p50 20.1 ms /
+p95 31.3 ms, writes accepted in p95 0.10 ms, server arrival spacing p50 20.0 ms / p95 29.7 ms —
+i.e. the spread was the page's timer under load, and the browser queued nothing.
+
 ### Load generator
 
 The same page can run a **saturating HTTP transfer to the same server**, started and stopped by
