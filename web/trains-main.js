@@ -30,6 +30,17 @@ function ticker(intervalMs) {
 
 let lastResults = null;
 
+// When the page is served from the deployed host, point every transport at that
+// host: WebTransport on its own UDP port, the WebRTC signaling and the HTTP
+// train endpoints behind nginx on the same origin. Local dev keeps the
+// per-server ports the form ships with.
+if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(location.hostname)) {
+  const f = form.elements;
+  f.url.value = `https://${location.hostname}:4433/probe`;
+  f.signalUrl.value = `${location.origin}/rtc/offer`;
+  f.postUrl.value = `${location.origin}/trains/post`;
+}
+
 function log(text) {
   $('log').textContent += `[${new Date().toLocaleTimeString()}] ${text}\n`;
   $('log').scrollTop = $('log').scrollHeight;
