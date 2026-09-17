@@ -1,0 +1,17 @@
+[Unit]
+Description=browser-cc-test WebTransport probe server (UDP @PORT@)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@RUN_USER@
+WorkingDirectory=@REPO@/server
+# Override PROBE_ARGS (e.g. --cc reno) in /etc/default/browser-cc-probe.
+Environment="PROBE_ARGS=--cc null"
+EnvironmentFile=-/etc/default/browser-cc-probe
+ExecStart=@REPO@/server/.venv/bin/python server.py --port @PORT@ --cert /etc/browser-cc-probe/cert.pem --key /etc/browser-cc-probe/key.pem $PROBE_ARGS
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

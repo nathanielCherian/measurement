@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser CC Probe</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafafa; --card:#fff; --line:#e3e3e6; --accent:#2563eb; }
+  body { font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; padding: 16px; }
+  main { max-width: 1000px; margin: 0 auto; display: grid; gap: 16px; }
+  h1 { font-size: 18px; margin: 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+  form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; }
+  label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+  input, select, textarea { font: 13px ui-monospace, monospace; padding: 5px 6px; border: 1px solid var(--line); border-radius: 4px; }
+  textarea { min-height: 42px; resize: vertical; }
+  .wide { grid-column: 1 / -1; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: #fff; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  pre { margin: 0; font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; max-height: 240px; overflow: auto; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  canvas { width: 100%; height: 220px; display: block; }
+  .legend { font-size: 12px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+  h2 { font-size: 15px; margin: 0 0 4px; }
+  .note { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+  .stat.flag b { color: #b45309; }
+  .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Browser ⇄ server datagram probe (WebTransport)</h1>
+
+  <section class="card">
+    <form id="form">
+      <label class="wide">Server URL <input name="url" value="https://127.0.0.1:4433/probe"></label>
+      <label>Mode
+        <select name="mode">
+          <option value="up">up (browser → server, JS CC)</option>
+          <option value="down">down (server → browser, server CC)</option>
+          <option value="both">both</option>
+        </select>
+      </label>
+      <label>Duration (s) <input name="durationS" type="number" value="10" min="1" step="1"></label>
+      <label>Datagram size (bytes) <input name="size" type="number" value="1000" min="64" max="1100"></label>
+      <label>Browser QUIC CC hint
+        <select name="browserCongestionControl">
+          <option>default</option><option>throughput</option><option>low-latency</option>
+        </select>
+      </label>
+      <label>Up CC (browser) <select name="upCCName"><option>fixed</option><option>aimd</option></select></label>
+      <label>Up CC params (JSON) <textarea name="upCCParams">{"rate_mbps": 2}</textarea></label>
+      <label>Down CC (server) <select name="downCCName"><option>fixed</option><option>aimd</option></select></label>
+      <label>Down CC params (JSON) <textarea name="downCCParams">{"rate_mbps": 2}</textarea></label>
+      <label>ACK mode (both directions)
+        <select name="ackMode">
+          <option value="block">block (ranges + timestamps)</option>
+          <option value="packet">per packet</option>
+        </select>
+      </label>
+      <label>Block ACK interval (ms) <input name="ackIntervalMs" type="number" value="20" min="1"></label>
+      <label>Block ACK every N packets <input name="ackEveryN" type="number" value="16" min="1"></label>
+      <label>outgoingMaxAge (ms, 0 = default) <input name="outgoingMaxAgeMs" type="number" value="100"></label>
+      <label>outgoingHighWaterMark (datagrams) <input name="outgoingHighWaterMark" type="number" value="256"></label>
+      <div class="row wide">
+        <button id="run" type="submit">Run</button>
+        <button id="download" type="button" class="secondary" disabled>Download JSON</button>
+        <span id="status" style="color:var(--muted)"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="card">
+    <div class="stats" id="stats"></div>
+  </section>
+
+  <section class="card">
+    <div class="legend" id="rateLegend"></div>
+    <canvas id="rateChart"></canvas>
+    <div class="legend" id="rttLegend"></div>
+    <canvas id="rttChart"></canvas>
+  </section>
+
+  <section class="card">
+    <h2>Is QUIC congestion control limiting browser → server?</h2>
+    <p class="note">Browser: WebTransport <code>getStats()</code>, where the browser exposes it. Server: analysis of received
+      packets: inter-arrival times, forward delay vs the server's QUIC RTT, and QUIC packet-number vs probe-sequence loss.</p>
+    <div class="stats" id="quicStats"><div class="stat"><span>Run an up or both test</span></div></div>
+    <div class="legend" id="delayLegend"></div>
+    <canvas id="delayChart"></canvas>
+    <div class="legend" id="iatLegend"></div>
+    <canvas id="iatChart"></canvas>
+  </section>
+
+  <section class="card"><pre id="log"></pre></section>
+</main>
+<script type="module" src="main.js"></script>
+</body>
+</html>

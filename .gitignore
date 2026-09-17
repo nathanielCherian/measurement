@@ -1,0 +1,5 @@
+server/.venv/
+server/certs/
+server/logs/
+web/cert-hash.json
+__pycache__/
