@@ -286,20 +286,34 @@ The browser pages measure browser + QUIC + path + server all at once. Two comman
 layers off that stack so the difference names the culprit:
 
 ```sh
-# 1. the path alone - plain UDP, no QUIC, no browser
+# 1. throughput of the path alone - plain UDP, no QUIC, no browser
 python3 tools/udp_probe.py serve --port 4444            # on the server (ufw allow 4444/udp)
 python3 tools/udp_probe.py send --host probe.example.edu --port 4444 --seconds 10 --mbps 0
 python3 tools/udp_probe.py send --host ... --ramp 1,5,10,25,50,100   # find the knee
 
-# 2. the same server and protocol, just not a browser
+# 2. delay of the path alone - the RTT monitor without a browser
+python3 tools/udp_rtt.py serve --port 4445              # on the server (ufw allow 4445/udp)
+python3 tools/udp_rtt.py send --host probe.example.edu --port 4445 --seconds 30
+python3 tools/udp_rtt.py send --host ... --load-mbps 50              # delay under load
+
+# 3. the same server and protocol, just not a browser
 server/.venv/bin/python tools/quic_probe.py --url https://127.0.0.1:4433/probe --insecure
 ```
 
-| Tool | Stack under test |
-|---|---|
-| `udp_probe.py` | the path |
-| `quic_probe.py` | the path + QUIC + the server's Python receive loop |
-| `capacity.html` | the path + QUIC + the server + the browser |
+| Tool | Stack under test | Measures |
+|---|---|---|
+| `udp_probe.py` | the path | throughput |
+| `udp_rtt.py` | the path | delay |
+| `quic_probe.py` | the path + QUIC + the server's Python receive loop | throughput |
+| `capacity.html` / `rtt.html` | the path + QUIC + the server + the browser | both |
+
+`udp_rtt.py` imports `RttMonitor` and `RttStreamReceiver` from `server/rtt.py`, so it is the same
+arithmetic as the page — `rtt_ms`, `queue_ms`, `up_excess_ms`, `owd_excess_ms`, `iat_ms` all mean
+exactly what they mean in `web/rtt.html`, and the two can be read side by side. It prints a live
+line per second (rtt / min / srtt / per-leg excess / loss), reports the responder's view of the
+stream at the end, and `--load-mbps` runs a saturating flood beside the probe, the command-line
+equivalent of the page's load buttons. Delay that stays flat here while the page's climbs over the
+same path is queueing **inside the browser**, not in the network.
 
 Each step down prices one layer. Measured on loopback (so "the path" is free and only the software
 costs anything):
