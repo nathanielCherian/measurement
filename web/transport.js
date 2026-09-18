@@ -86,6 +86,50 @@ export async function connectWebTransport(cfg, onProbe, opts = {}) {
   };
 }
 
+// POST the SDP offer and insist on getting an SDP answer back.
+//
+// The failure this exists for: when the signaling URL reaches something that
+// is not rtc_server.py - nginx with no /rtc/ location, or a 502 because the
+// service is down, or the static server 404ing - the reply is an HTML error
+// page, and parsing it as JSON fails with "Unexpected token '<'", which tells
+// you nothing about what is actually wrong. So check the status and the
+// content type first, and report the URL, the status and what came back.
+export async function signal(signalUrl, offer) {
+  let res;
+  try {
+    res = await fetch(signalUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+    });
+  } catch (e) {
+    throw new Error(`signaling POST to ${signalUrl} failed to connect (${e.message}). ` +
+      `Is rtc_server.py running, and is the URL right?`);
+  }
+
+  const body = await res.text();
+  const looksJson = (res.headers.get('content-type') || '').includes('json') || body.trim().startsWith('{');
+  if (!res.ok || !looksJson) {
+    const snippet = body.replace(/\s+/g, ' ').slice(0, 120);
+    const hint = [502, 503, 504].includes(res.status)
+      ? 'a proxy is there but cannot reach the signaling service behind it ' +
+        '(check: systemctl status browser-cc-rtc, journalctl -u browser-cc-rtc)'
+      : res.status === 404
+        ? 'nothing is serving that path - nginx may have no /rtc/ location (re-run deploy/install.sh)'
+        : [405, 501].includes(res.status)
+          ? 'that URL is a plain file server, which will not accept a POST - point it at rtc_server.py ' +
+            '(http://host:8080/offer, or /rtc/offer behind nginx)'
+          : 'that URL is served by something other than rtc_server.py';
+    throw new Error(`signaling POST to ${signalUrl} returned ${res.status} ${res.statusText} ` +
+      `(${snippet || 'empty body'}) - ${hint}.`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error(`signaling POST to ${signalUrl} returned invalid JSON: ${body.slice(0, 120)}`);
+  }
+}
+
 // A data channel caps one message (64 KB in aiortc), and a run's results are
 // bigger than that, so the NDJSON stream is cut into chunks; the peer
 // reassembles on newlines (see rtc_session.py, which chunks the same way).
@@ -108,11 +152,7 @@ export async function connectWebRTC(cfg, onProbe) {
     pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && resolve();
     setTimeout(resolve, 3000);
   });
-  const answer = await (await fetch(cfg.signalUrl, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
-  })).json();
-  await pc.setRemoteDescription(answer);
+  await pc.setRemoteDescription(await signal(cfg.signalUrl, pc.localDescription));
   await Promise.all([controlCh, probe].map((ch) => new Promise((resolve, reject) => {
     if (ch.readyState === 'open') return resolve();
     ch.onopen = resolve;

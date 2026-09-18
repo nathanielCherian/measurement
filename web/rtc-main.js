@@ -11,6 +11,7 @@ import { drawChart } from './chart.js';
 import { makeCC } from './cc/index.js';
 import * as proto from './protocol.js';
 import { ReceiverStats, SenderCore } from './stats.js';
+import { signal } from './transport.js';
 
 const $ = (id) => document.getElementById(id);
 const form = $('form');
@@ -139,12 +140,7 @@ async function run(cfg) {
   log(`signaling via ${cfg.signalUrl}`);
   await pc.setLocalDescription(await pc.createOffer());
   await iceComplete(pc);
-  const answer = await (await fetch(cfg.signalUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
-  })).json();
-  await pc.setRemoteDescription(answer);
+  await pc.setRemoteDescription(await signal(cfg.signalUrl, pc.localDescription));
   await Promise.all([channelOpen(control), channelOpen(probe)]);
   log(`data channels open (probe: ordered=${probe.ordered}, maxRetransmits=${probe.maxRetransmits})`);
 
