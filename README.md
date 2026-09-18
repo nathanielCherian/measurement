@@ -231,6 +231,15 @@ never retransmitted, so once the cwnd is full the browser discards them **in its
 number with no missing packet number around it is proof the browser refused to send it
 (`dropped_before_send_estimate`). `server/saturation.py` turns that into a verdict.
 
+Works over WebRTC too, with one honest limitation: **SCTP has no packet-number equivalent**, so a
+missing sequence number cannot be attributed to the browser or the network. On that transport the
+page reports total end-to-end loss and says *"where they were lost: not observable on SCTP"* rather
+than implying a split it cannot measure. Use WebTransport when you need to know *where* packets died.
+
+Delivery over a data channel is also bursty — the sender stalls on `bufferedAmount`, then dumps —
+so the report gives both the **mean rate over the run** (what got through) and the **rate while
+sending** (the burst rate), and flags when they diverge.
+
 Two modes:
 
 - **saturate** — write flat out for the run. Simplest ceiling measurement.

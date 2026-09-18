@@ -61,6 +61,7 @@ def summarize_saturation(
     client_offered: Optional[Dict[str, Any]] = None,
     ramp_ms: float = DEFAULT_RAMP_MS,
     server_load: Optional[Dict[str, Any]] = None,
+    app_loss: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Steady-state rate plus the evidence for what limited it."""
     if not up_analysis or not up_analysis.get("timeline"):
@@ -79,6 +80,14 @@ def summarize_saturation(
         steady_bins = [b for b in timeline if b["recv_bps"] > floor]
     steady = _rate_stats(steady_bins)
 
+    # The median of the bins that carried something is the rate *while sending*,
+    # which is not the rate achieved if delivery came in bursts separated by
+    # stalls (a data channel backing up behind its own send queue does exactly
+    # that). The mean over every bin, empty ones included, is what actually got
+    # through, so report both and say when they disagree.
+    mean_rate = sum(b["recv_bps"] for b in timeline) / len(timeline) if timeline else None
+    bursty = bool(steady and mean_rate and mean_rate < 0.6 * steady["p50"])
+
     # Time to reach 90% of the steady-state rate - the slow-start ramp.
     ramp_to_90 = None
     if steady:
@@ -94,7 +103,11 @@ def summarize_saturation(
     srtt_p50 = _percentiles(srtts)["p50"] if srtts else None
     cwnd_bytes = (steady["p50"] / 8) * (srtt_p50 / 1000) if steady and srtt_p50 else None
 
+    # QUIC packet numbers are what let us say *where* a packet died. Over an
+    # SCTP data channel there is no equivalent, so the loss split is absent and
+    # the verdict must not pretend otherwise.
     loss = up_analysis.get("loss_split") or {}
+    split_available = bool(up_analysis.get("loss_split"))
     local_dropped = loss.get("dropped_before_send_estimate")
     network_missing = loss.get("quic_packets_missing")
     app_missing = loss.get("app_packets_missing")
@@ -110,6 +123,8 @@ def summarize_saturation(
         "ramp_ms": ramp_ms,
         "rate_bps": all_rates,
         "steady_rate_bps": steady,
+        "mean_rate_bps": mean_rate,
+        "bursty": bursty,
         "peak_bin_bps": all_rates["max"],
         "ramp_to_90pct_ms": ramp_to_90,
         "quic_srtt_p50_ms": srtt_p50,
@@ -121,7 +136,14 @@ def summarize_saturation(
         "quic_packets_missing": network_missing,
         "app_packets_missing": app_missing,
         "bins_flagged_quic_limited": flagged,
+        "loss_split_available": split_available,
     }
+    if not split_available and app_loss:
+        # All we have is application-level loss: sequence numbers that never
+        # arrived, with no way to tell a local drop from a network one.
+        out["app_loss_rate"] = app_loss.get("loss_rate")
+        out["app_received"] = app_loss.get("received")
+        out["app_expected"] = app_loss.get("expected")
     if server_load:
         lag = _percentiles(server_load.get("loop_lag_ms") or [])
         cpu = _percentiles(server_load.get("cpu_fraction") or [])
@@ -133,6 +155,13 @@ def summarize_saturation(
             "server_busy": bool((lag and lag["p95"] > SERVER_LAG_MS) or (cpu and cpu["p95"] > SERVER_CPU_BUSY)),
         }
     out["verdict"] = _verdict(out)
+    if bursty:
+        out["verdict"]["explanation"] += (
+            f" Delivery was bursty: while it was arriving the rate was "
+            f"{steady['p50'] / 1e6:.1f} Mbps, but averaged over the run only "
+            f"{mean_rate / 1e6:.1f} Mbps got through - the sender spent much of the run stalled, so "
+            f"read the mean as the throughput and the median as the burst rate."
+        )
     return out
 
 
@@ -144,8 +173,11 @@ def _verdict(s: Dict[str, Any]) -> Dict[str, Any]:
     delivered = s.get("delivered_packets") or 0
     offered = s.get("offered_packets")
 
-    local_frac = local / offered if offered else None
-    net_frac = net / (delivered + net) if (delivered + net) else None
+    # Without a packet-number split these fractions have no meaning: "0% dropped
+    # in the browser" would be an assertion we cannot make, not a measurement.
+    split = s.get("loss_split_available")
+    local_frac = local / offered if (split and offered) else None
+    net_frac = net / (delivered + net) if (split and (delivered + net)) else None
 
     load = s.get("server_load") or {}
     if load.get("server_busy"):
@@ -161,14 +193,39 @@ def _verdict(s: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "limited_by": "server",
             "explanation": (
-                f"This server could not keep up: {' and '.join(reasons)}. aioquic decrypts "
-                "every packet in Python, which costs far more per packet than the kernel's TCP path, so a "
-                "datagram rate measured against it is the *server's* ceiling, not the browser's. Compare "
-                "against a server that is not the bottleneck before concluding anything about the browser."
+                f"This server could not keep up: {' and '.join(reasons)}. Every packet is processed in "
+                "Python here - QUIC decryption for WebTransport, the SCTP stack for data channels - which "
+                "costs far more per packet than the kernel's TCP path, so a rate measured against it is the "
+                "*server's* ceiling, not the browser's. Compare against a server that is not the bottleneck "
+                "before concluding anything about the browser."
             ),
             "steady_rate_bps": steady,
             "local_drop_fraction": local_frac,
             "network_loss_fraction": net_frac,
+        }
+
+    if not s.get("loss_split_available"):
+        rate = s.get("app_loss_rate")
+        lost_note = (f"{100 * rate:.2f}% of the packets sent never arrived"
+                     if rate else "nothing was lost end to end")
+        if rate and rate > 0.001:
+            who, why = "unclear", (
+                f"This transport gives the receiver no packet-number equivalent, so a missing "
+                f"sequence number cannot be attributed: {lost_note}, but whether the browser's SCTP "
+                f"stack dropped it or the network did is not observable from here. The rate is what "
+                f"got through; to place the limit, watch the page's bufferedAmount stalls (its own "
+                f"send queue filling) or re-run over WebTransport, where QUIC packet numbers make "
+                f"the split possible."
+            )
+        else:
+            who, why = "sender", (
+                f"Nothing was lost ({lost_note}), so nothing was overloaded and this rate is a floor "
+                f"on what the transport would carry, not a ceiling. Raise the packet size or the "
+                f"send window, or use WebTransport, where the loss split can say where the limit is."
+            )
+        return {
+            "limited_by": who, "explanation": why, "steady_rate_bps": steady,
+            "local_drop_fraction": None, "network_loss_fraction": None,
         }
 
     if offered and delivered and local < 0.001 * offered and net < 0.001 * delivered:

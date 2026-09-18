@@ -21,6 +21,7 @@ import protocol as proto
 from ack import AckGenerator
 from appcc import make_cc
 from rtt import RttMonitor, RttStreamReceiver, run_rtt_stream
+from saturation import summarize_saturation, window_report
 from trains import TrainReceiver, send_trains
 from transport_stats import ReceiverStats, SenderCore
 from up_analysis import analyze_up
@@ -69,6 +70,9 @@ class RtcSession:
         self.up_rtt = RttStreamReceiver()
         self.down_rtt = RttMonitor()
         self._rtt_task: Optional[asyncio.Task] = None
+        self._sat_task: Optional[asyncio.Task] = None
+        self.loop_lag_ms: List[float] = []
+        self.cpu_fraction: List[float] = []
         self.up_sctp_samples: List[Dict[str, Any]] = []
         self._task: Optional[asyncio.Task] = None
         self._up_task: Optional[asyncio.Task] = None
@@ -126,9 +130,15 @@ class RtcSession:
                 self._task = asyncio.ensure_future(self._run_down())
             if msg.get("mode") in ("up", "both"):
                 self._up_task = asyncio.ensure_future(self._sample_up_sctp())
+            if msg.get("saturate"):
+                self._sat_task = asyncio.ensure_future(self._report_progress(msg["saturate"]))
         elif kind == "finish":
             if self._up_task:
                 self._up_task.cancel()
+            if self._sat_task:
+                self._sat_task.cancel()
+            if msg.get("client_offered") and self.config.get("saturate") is not None:
+                self.config["saturate"]["client_offered"] = msg["client_offered"]
             self.send_control({"type": "server_report", **self.report(brief=True)})
         elif kind == "results":
             path = self._save(msg)
@@ -216,6 +226,38 @@ class RtcSession:
         core.check_timeouts(now_ms() + 1e9)
         self.send_control({"type": "down_done", **core.summary()})
 
+    async def _report_progress(self, cfg: Dict[str, Any]) -> None:
+        """Live view of what is arriving, plus this server's own load.
+
+        Same contract as session.py's: the page cannot see how much of what it
+        writes survives the browser's send queue, so the server's count is the
+        measurement and has to come back during the run.
+        """
+        interval = float(cfg.get("progress_ms", 500)) / 1000
+        last = now_ms()
+        loop = asyncio.get_event_loop()
+        while not self.closed:
+            before, cpu_before = loop.time(), time.process_time()
+            await asyncio.sleep(interval)
+            lag_ms = max(0.0, (loop.time() - before - interval) * 1000)
+            cpu_frac = (time.process_time() - cpu_before) / max(1e-9, loop.time() - before)
+            self.loop_lag_ms.append(lag_ms)
+            self.cpu_fraction.append(cpu_frac)
+            t = now_ms()
+            if self.up.records is None:
+                continue
+            win = window_report(self.up.records, last, t)
+            last = t
+            self.send_control({
+                "type": "up_progress",
+                "t_ms": t - (self.start_ms or self.created),
+                **win,
+                "sctp": self._sctp_state(),
+                "packets_total": self.up.received,
+                "server_loop_lag_ms": lag_ms,
+                "server_cpu_fraction": cpu_frac,
+            })
+
     def _sctp(self):
         return getattr(self.pc, "sctp", None)
 
@@ -293,6 +335,15 @@ class RtcSession:
             # No packet-number equivalent here, so no local-drop split: SCTP
             # gives us no per-packet transmission record for the peer.
             out["up_analysis"] = analyze_up(self.up.records, None, self.up_sctp_samples, self.start_ms or self.created)
+        if out.get("up_analysis") and self.config.get("saturate"):
+            out["saturation"] = summarize_saturation(
+                out["up_analysis"],
+                client_offered=self.config.get("saturate", {}).get("client_offered"),
+                server_load={"loop_lag_ms": self.loop_lag_ms, "cpu_fraction": self.cpu_fraction},
+                # SCTP has no packet-number equivalent, so a missing sequence
+                # number cannot be attributed to the browser or to the network.
+                app_loss=out["up"],
+            )
         if self.down:
             out["down"] = {
                 **self.down.summary(),
@@ -332,6 +383,8 @@ class RtcSession:
             self._trains_task.cancel()
         if self._rtt_task:
             self._rtt_task.cancel()
+        if self._sat_task:
+            self._sat_task.cancel()
         for task in (self._task, self._up_task):
             if task:
                 task.cancel()

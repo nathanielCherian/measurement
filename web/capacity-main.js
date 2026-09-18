@@ -254,7 +254,8 @@ async function run(cfg) {
       const msg = await conn.control.waitFor('up_progress', cfg.durationS * 1000 + 30000).catch(() => null);
       if (!msg) return;
       progress.push({ t_s: msg.t_ms / 1000, bps: msg.bps, packets: msg.packets_total,
-        srtt: msg.quic?.srtt_ms ?? null });
+        srtt: msg.quic?.srtt_ms ?? msg.sctp?.srtt_ms ?? null,
+        buffered: msg.sctp?.buffered ?? null });
       if (stopRun) return;
     }
   })();
@@ -350,7 +351,8 @@ function drawRateChart() {
   ];
   drawChart($('rateChart'), $('rateLegend'), series, 'Mbps');
   drawChart($('rttChart'), $('rttLegend'),
-    [{ name: 'server-measured QUIC srtt (browser → server)', color: '#dc2626',
+    [{ name: `server-measured ${lastResults?.transport === 'webrtc' ? 'SCTP' : 'QUIC'} srtt (browser → server)`,
+       color: '#dc2626',
        points: progress.filter((p) => p.srtt != null).map((p) => [p.t_s, p.srtt]) }], 'ms');
 }
 
@@ -359,14 +361,19 @@ function render(r) {
   const ana = r.server?.up_analysis;
   const c = r.client;
   const rows = [
-    ['steady-state rate @server', fmt.mbps(sat?.steady_rate_bps?.p50)],
+    ['rate while sending (p50)', fmt.mbps(sat?.steady_rate_bps?.p50)],
+    ['mean rate over the run', fmt.mbps(sat?.mean_rate_bps), sat?.bursty],
     ['peak 100 ms bin', fmt.mbps(sat?.peak_bin_bps)],
     ['offered by the page', fmt.mbps(c?.offered_bps)],
     ['delivered / offered packets', `${fmt.n(sat?.delivered_packets)} / ${fmt.n(c?.offered_packets)}`],
-    ['dropped inside the browser', fmt.n(sat?.dropped_in_browser), (sat?.dropped_in_browser ?? 0) > 0],
-    ['lost in the network (QUIC pkts)', fmt.n(sat?.quic_packets_missing), (sat?.quic_packets_missing ?? 0) > 0],
+    ...(sat?.loss_split_available === false
+      ? [['packets lost end to end', sat?.app_loss_rate == null ? '–' : fmt.pct(sat.app_loss_rate),
+          (sat?.app_loss_rate ?? 0) > 0.001],
+         ['where they were lost', 'not observable on SCTP']]
+      : [['dropped inside the browser', fmt.n(sat?.dropped_in_browser), (sat?.dropped_in_browser ?? 0) > 0],
+         ['lost in the network (QUIC pkts)', fmt.n(sat?.quic_packets_missing), (sat?.quic_packets_missing ?? 0) > 0]]),
     ['ramp to 90% of steady state', sat?.ramp_to_90pct_ms == null ? '–' : `${(sat.ramp_to_90pct_ms / 1000).toFixed(1)} s`],
-    ['server QUIC srtt p50', fmt.ms(sat?.quic_srtt_p50_ms)],
+    [r.transport === 'webrtc' ? 'server SCTP srtt p50' : 'server QUIC srtt p50', fmt.ms(sat?.quic_srtt_p50_ms)],
     ['implied bytes in flight', sat?.implied_cwnd_bytes == null ? '–' : `${(sat.implied_cwnd_bytes / 1024).toFixed(0)} KB`],
     ['bins flagged browser-queued', fmt.n(ana?.bins_flagged_quic_limited), (ana?.bins_flagged_quic_limited ?? 0) > 0],
     ['server event-loop lag p95', fmt.ms(sat?.server_load?.loop_lag_ms?.p95), sat?.server_load?.server_busy],
@@ -426,11 +433,16 @@ function verdict(r) {
       `QUIC frame and UDP send, capped at maxDatagramSize (~1.2 KB). Per-packet cost, not congestion control, is often ` +
       `the difference - check whether packets were dropped inside the browser above before blaming its CC.</p>`);
   }
-  parts.push(`<p class="note">Steady state ${fmt.mbps(sat.steady_rate_bps?.p50)} ` +
+  parts.push(`<p class="note">${sat.bursty ? `Mean over the run ${fmt.mbps(sat.mean_rate_bps)}; while sending ` : 'Steady state '}` +
+    `${fmt.mbps(sat.steady_rate_bps?.p50)} ` +
     `(p25 ${fmt.mbps(sat.steady_rate_bps?.p25)}, p95 ${fmt.mbps(sat.steady_rate_bps?.p95)}) over ` +
     `${sat.steady_bins} bins of ${sat.bin_ms} ms, after skipping the first ${(sat.ramp_ms / 1000).toFixed(1)} s of ramp. ` +
-    `Of ${fmt.n(sat.offered_packets)} packets offered, ${fmt.pct(v.local_drop_fraction)} never left the browser and ` +
-    `${fmt.pct(v.network_loss_fraction)} of what left was lost on the way.</p>`);
+    // Only WebTransport can say where a packet died; on SCTP report the total.
+    (v.local_drop_fraction == null
+      ? `Of ${fmt.n(sat.offered_packets)} packets offered, ${fmt.pct(sat.app_loss_rate)} never arrived, and this ` +
+        `transport cannot say whether the browser or the network dropped them.`
+      : `Of ${fmt.n(sat.offered_packets)} packets offered, ${fmt.pct(v.local_drop_fraction)} never left the browser ` +
+        `and ${fmt.pct(v.network_loss_fraction)} of what left was lost on the way.`) + '</p>');
   if (r.config?.mode === 'ramp') {
     parts.push('<p class="note">Stepped mode: look for the step where the delivered line stops following the offered ' +
       'line on the chart above. That knee is the rate the browser stopped accepting more.</p>');
