@@ -113,6 +113,32 @@ Differences from the WebTransport page:
 Deployment adds `browser-cc-rtc.service` and an nginx `location /rtc/` proxy; ICE needs the
 ephemeral UDP range open (`ufw allow 32768:60999/udp`, added by `deploy/install.sh`).
 
+**Installing aiortc when `av` has no wheel.** aiortc requires `av>=14` and imports it at load time
+(`mediastreams.py`), so it must be installed even though this project only uses data channels and
+never touches a codec. If pip downloads the ~4 MB `av` *sdist* instead of a ~30 MB wheel it will try
+to build PyAV against ffmpeg 7 and fail. Upgrade pip first — an old pip cannot match current wheel
+tags and silently falls back to source:
+
+```sh
+.venv/bin/python -m pip install --upgrade pip setuptools wheel
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+If no wheel exists for that Python/architecture at all, skip the pin rather than installing ffmpeg
+build dependencies:
+
+```sh
+.venv/bin/python -m pip install av aioice cffi cryptography google-crc32c pyee pylibsrtp pyopenssl
+.venv/bin/python -m pip install --no-deps aiortc==1.13.0
+```
+
+Any recent `av` will do — only `AudioFrame`, `VideoFrame`, `Frame` and `Packet` are imported. This
+is what the development machine runs (av 13.1.0 under aiortc 1.13.0), and data channels work on it.
+
+Note that `.venv/bin/pip` can fail with `cannot execute: required file not found` while
+`.venv/bin/python` works: the wrapper hardcodes an interpreter path that no longer resolves. Always
+invoke it as `.venv/bin/python -m pip`, which `deploy/install.sh` does.
+
 ## Acknowledgements
 
 The receiver acknowledges probe packets in one of two modes, chosen on the page and used in both directions:
