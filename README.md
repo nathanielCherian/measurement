@@ -242,6 +242,47 @@ Caveats: this saturates the uplink (a phone on 5G burns real data — runs are c
 page says so); Chrome's `maxDatagramSize` is ~1024 B, so larger packet sizes are clamped; and per
 -packet records are capped server-side (`MAX_RECORDS`) with the 100 ms bins carrying the analysis.
 
+### Controls without a browser (`tools/`)
+
+The browser pages measure browser + QUIC + path + server all at once. Two command-line tools strip
+layers off that stack so the difference names the culprit:
+
+```sh
+# 1. the path alone - plain UDP, no QUIC, no browser
+python3 tools/udp_probe.py serve --port 4444            # on the server (ufw allow 4444/udp)
+python3 tools/udp_probe.py send --host probe.example.edu --port 4444 --seconds 10 --mbps 0
+python3 tools/udp_probe.py send --host ... --ramp 1,5,10,25,50,100   # find the knee
+
+# 2. the same server and protocol, just not a browser
+server/.venv/bin/python tools/quic_probe.py --url https://127.0.0.1:4433/probe --insecure
+```
+
+| Tool | Stack under test |
+|---|---|
+| `udp_probe.py` | the path |
+| `quic_probe.py` | the path + QUIC + the server's Python receive loop |
+| `capacity.html` | the path + QUIC + the server + the browser |
+
+Each step down prices one layer. Measured on loopback (so "the path" is free and only the software
+costs anything):
+
+| | rate | bounded by |
+|---|---|---|
+| raw UDP | **2,122 Mbps** | the sink's CPU (100%) |
+| Python QUIC client | **249 Mbps** | the server's CPU (100%) |
+| Chrome | **116 Mbps** | the server's CPU (100%) |
+
+The lesson for any datagram number measured against this server: **aioquic's per-packet cost in
+Python is the ceiling long before the network is**, and raw UDP over the same path shows how much
+headroom the link really had. `udp_probe.py` counts its own failed sends separately (`ENOBUFS` is
+the local equivalent of the browser dropping a datagram), so loss on the wire is
+`sent - received - send_failures`, and both tools flag it when the receiver was CPU-bound rather
+than the path.
+
+`udp_probe.py` has no congestion control by design — it is an unresponsive flood. Keep the runs
+short and don't point it at a shared link you care about. `quic_probe.py` needs aioquic, so run it
+from `server/.venv`.
+
 ## RTT monitor (`web/rtt.html`)
 
 A thin, steady stream instead of a burst: one small packet every `interval_ms` (default 64 B every
