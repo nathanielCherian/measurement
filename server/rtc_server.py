@@ -75,7 +75,23 @@ async def http_handler(reader, writer, log_dir: str) -> None:
         elif method == "POST" and path.rstrip("/").endswith("/offer"):
             body = await reader.readexactly(int(headers.get("content-length", 0)))
             peer = str(writer.get_extra_info("peername"))
-            answer = json.dumps(await handle_offer(json.loads(body), log_dir, peer)).encode()
+            # Answer a malformed offer with 400 rather than letting the handler
+            # raise: the connection would die mid-response and a proxy in front
+            # would report it as 502, which reads as "the service is down".
+            try:
+                offer = json.loads(body)
+                if not isinstance(offer, dict) or not offer.get("sdp") or offer.get("type") != "offer":
+                    raise ValueError("expected {\"sdp\": ..., \"type\": \"offer\"}")
+            except (json.JSONDecodeError, ValueError) as exc:
+                log.warning("bad offer from %s: %s", writer.get_extra_info("peername"), exc)
+                msg = json.dumps({"error": str(exc)}).encode()
+                writer.write(
+                    f"HTTP/1.1 400 Bad Request\r\n{CORS}Content-Type: application/json\r\n"
+                    f"Content-Length: {len(msg)}\r\n\r\n".encode() + msg
+                )
+                await writer.drain()
+                return
+            answer = json.dumps(await handle_offer(offer, log_dir, peer)).encode()
             writer.write(
                 f"HTTP/1.1 200 OK\r\n{CORS}Content-Type: application/json\r\n"
                 f"Content-Length: {len(answer)}\r\n\r\n".encode() + answer
