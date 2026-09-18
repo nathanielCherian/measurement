@@ -31,8 +31,29 @@ LIVE=/etc/letsencrypt/live/$DOMAIN
 
 command -v nginx >/dev/null || die "nginx not found"
 [[ -x $REPO/server/.venv/bin/python ]] || die "missing $REPO/server/.venv (create it first)"
-sudo -u "$RUN_USER" "$REPO/server/.venv/bin/python" -c "import aioquic" \
-  || die "aioquic not installed in server/.venv"
+
+# Install whatever requirements.txt asks for. A venv built before a dependency
+# was added is otherwise invisible here: the probe server starts, and the
+# service whose import is missing crash-loops behind nginx, showing up only as
+# a 502 on the page. (That is exactly how aiortc went missing.)
+echo "==> python dependencies"
+VENV_PY=$REPO/server/.venv/bin/python
+if ! sudo -u "$RUN_USER" "$VENV_PY" -m pip install -q -r "$REPO/server/requirements.txt"; then
+  echo "    WARNING: pip install failed; continuing with what is already installed"
+fi
+
+check_import() {  # module, what breaks without it, fatal?
+  if sudo -u "$RUN_USER" "$VENV_PY" -c "import $1" 2>/dev/null; then
+    echo "    $1 ok"
+  elif [[ ${3:-} == fatal ]]; then
+    die "$1 not installed in server/.venv - $2"
+  else
+    echo "    WARNING: $1 missing - $2"
+    MISSING="${MISSING:-} $1"
+  fi
+}
+check_import aioquic "the WebTransport probe server cannot run" fatal
+check_import aiortc "rtc.html and every WebRTC page will get a 502 from /rtc/offer"
 
 if [[ -d /etc/nginx/sites-available && -d /etc/nginx/sites-enabled ]]; then
   SITE=/etc/nginx/sites-available/browser-cc-probe-$DOMAIN.conf
@@ -123,5 +144,16 @@ systemctl is-active --quiet browser-cc-probe.service || systemctl start browser-
 
 sleep 1
 systemctl --no-pager --lines=5 status browser-cc-probe.service || true
+
+# A service that crash-loops shows up on the page only as a 502, so say it here.
+for unit in browser-cc-probe browser-cc-rtc browser-cc-http-trains; do
+  if systemctl is-active --quiet "$unit.service"; then
+    echo "    $unit: active"
+  else
+    echo "    $unit: NOT RUNNING - journalctl -u $unit -n 30"
+  fi
+done
+[[ -n ${MISSING:-} ]] && echo "    (missing python modules:${MISSING})"
+
 echo
 echo "done: open https://$DOMAIN/  (WebTransport: https://$DOMAIN:$PORT/probe, WebRTC: https://$DOMAIN/rtc.html)"

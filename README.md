@@ -57,7 +57,10 @@ The script:
 A certbot deploy hook copies each renewed certificate to `/etc/browser-cc-probe/` and restarts
 the server.
 
-- Update code or page: rsync, then re-run the same command.
+- Update code or page: rsync, then re-run the same command. `install.sh` installs
+  `server/requirements.txt` into the venv each time, checks that `aioquic` and `aiortc` import, and
+  prints whether each of the three services is actually running — a venv built before a dependency
+  was added otherwise fails invisibly, as a 502 from `/rtc/offer` rather than an error anywhere.
 - Switch QUIC CC: `echo 'PROBE_ARGS=--cc reno' | sudo tee /etc/default/browser-cc-probe && sudo systemctl restart browser-cc-probe`
 - Logs: `journalctl -u browser-cc-probe -f`; results in `server/logs/`.
 
